@@ -1,0 +1,6 @@
+.env
+*.csv
+testdata/
+__pycache__/
+*.pyc
+.DS_Store
