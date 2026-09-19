@@ -30,6 +30,20 @@ done); your session prompt names your role.
    CSV round-trip, resume-skip, apply idempotency, duplicate-asset_id
    guard tests.
 
+## Decision defaults (do not stop to ask)
+
+You may run unattended (headless dispatcher); a stopped session wastes the
+whole run. When a question is not answered by PLAN.md:
+
+- Follow PLAN.md literally; where it is silent, prefer the smallest
+  change that satisfies the build step and record the choice in the PR's
+  Handoff section.
+- API-shape doubts: follow the "Verified API reference" section of PLAN.md,
+  not external memory.
+- Never invent live-test results; mark anything untested as untested.
+- Only stop (open a GitHub issue) if proceeding would write to Immich
+  outside the apply flow or break existing CLI behavior.
+
 ## Hard constraints
 
 - **No live API calls.** The sandbox has no credentials and no network

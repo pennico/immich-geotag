@@ -1,0 +1,8 @@
+# Guardrails for unattended dispatcher runs.
+# Loaded when this folder is trusted (the dispatcher passes --trust).
+[[hooks]]
+name = "guard"
+type = "pre_tool"
+match = "re:(bash|read_file|write_file|edit)"
+command = "python3 .vibe/guard.py"
+timeout = 10.0

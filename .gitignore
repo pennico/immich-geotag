@@ -1,6 +1,8 @@
 .env
 *.csv
 testdata/
+dispatcher/logs/
+dispatcher/.lock
 __pycache__/
 *.pyc
 .DS_Store
