@@ -183,11 +183,18 @@ External APIs:
    `lens_locate()`. Update rows in place, rewrite the CSV after each row
    (crash-safe: quota spent is never lost). Print a per-row line and an
    end summary (located / not_found / errors).
-   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`; Chunk 2
+   completed in `vibe/recognize-apply-chunk2`: per-row ApiError handling
+   (Vision call now guarded), error rows stay `pending` so they are
+   retryable (no non-spec `error` status), dropped the dead `error`
+   column write.
 5. **`apply`:** for rows with coordinates and `status != applied`, call
    `set_location()`; mark `status=applied` only after a successful PUT.
    `--dry-run` prints the plan without writes. Summary at the end.
-   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`; Chunk 2
+   completed in `vibe/recognize-apply-chunk2`: CLI aligned with the plan
+   (`apply geotag.csv [--dry-run]` — write is the default, `--dry-run`
+   opts out), replacing the interim `--apply` flag.
 6. **`--thumbs DIR` mode (only if running on the server):** verify the
    thumbnail path layout against the installed Immich version first, then
    add a local-read branch in the preview fetch.
