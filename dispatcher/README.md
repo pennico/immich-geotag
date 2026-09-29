@@ -11,9 +11,9 @@ anyone launching sessions manually.
    pauses the repo; one with the `answered` label (owner commented +
    labeled) or closed by the owner resumes the loop with the answer quoted
    in the session prompt.
-3. Open PRs? -> any without the `approved` label triggers a QA session
-   (two QA passes without approval -> blocker issue + pause); all approved
-   + green checks -> squash-merge.
+3. Open PRs? -> merge approved + green ones first (squash); any
+   remaining without the `approved` label trigger a QA session (two QA
+   passes without approval -> blocker issue + pause).
 4. No PRs -> Implementation session on the first unchecked ROADMAP.md item
    (every chunk is an [impl] session).
 5. Roadmap complete -> idle + one "roadmap done" notification.
