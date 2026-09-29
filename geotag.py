@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """immich-geotag: fill in missing GPS coordinates in Immich.
 
-Finds images in your Immich library that have no GPS data, tries to
-recognize where they were taken, and (with --apply) writes the coordinates
-back to the asset.
+Three subcommands for a CSV-based workflow:
+
+  scan       list missing-GPS images from Immich      -> CSV rows (status=pending)
+  recognize  run recognition on pending rows          -> fills coordinates (no writes)
+  apply      write approved rows back to Immich       -> status=applied (idempotent)
 
 Recognition backends, tried in order:
   1. Google Cloud Vision landmark detection (exact lat/lng, landmarks only)
   2. SerpApi Google Lens (visual matches, geocoded via Nominatim) - only
      enabled when SERPAPI_KEY is set
-
-By default the tool runs in dry-run mode: it only prints the proposed
-coordinates. Use --apply to actually write them to Immich.
-
-Usage:
-  python3 geotag.py                          # dry run over all images
-  python3 geotag.py --limit 5                # dry run, first 5
-  python3 geotag.py --asset-id <uuid>        # dry run, single asset
-  python3 geotag.py --apply                  # write coordinates
-  python3 geotag.py --apply --min-score 0.8  # only high-confidence landmarks
 
 Configuration is read from environment variables and/or a .env file next to
 this script (see .env.example):
@@ -27,10 +19,17 @@ this script (see .env.example):
   GOOGLE_VISION_API_KEY  Google Cloud Vision API key     (required)
   SERPAPI_KEY            SerpApi key, enables Lens fallback (optional)
   NOMINATIM_EMAIL        contact email for Nominatim usage policy (optional)
+
+Usage:
+  python3 geotag.py scan --out geotag.csv [--limit N] [--asset-id UUID]
+  python3 geotag.py recognize geotag.csv [--min-score 0.5]
+  python3 geotag.py apply geotag.csv [--dry-run]
 """
 
 import argparse
 import base64
+import csv
+import io
 import json
 import os
 import re
@@ -43,6 +42,12 @@ import uuid
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LENS_MAX_UPLOAD = 500 * 1024  # SerpApi image upload limit
+
+# CSV schema column names
+CSV_COLUMNS = [
+    "asset_id", "file_name", "latitude", "longitude",
+    "place", "source", "score", "status", "maps_url",
+]
 
 
 class ApiError(Exception):
@@ -133,6 +138,55 @@ def load_env():
 
 
 # ---------------------------------------------------------------------------
+# CSV layer
+# ---------------------------------------------------------------------------
+
+def read_csv(path):
+    """Read a CSV file tolerantly. Returns list of dicts.
+
+    Unknown columns are ignored. Missing optional columns are treated as empty.
+    UTF-8.
+    """
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    return rows
+
+
+def write_csv(path, rows, columns=None):
+    """Write rows to CSV, preserving column order. UTF-8."""
+    if columns is None:
+        columns = CSV_COLUMNS
+    # Ensure all column keys exist in each row
+    for row in rows:
+        for col in columns:
+            if col not in row:
+                row[col] = ""
+    # Write preserving order
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def get_row_by_asset_id(rows, asset_id):
+    """Return the first row with matching asset_id, or None."""
+    for row in rows:
+        if row.get("asset_id") == asset_id:
+            return row
+    return None
+
+
+def asset_id_in_rows(rows, asset_id):
+    """Check if asset_id exists in rows."""
+    return get_row_by_asset_id(rows, asset_id) is not None
+
+
+# ---------------------------------------------------------------------------
 # Immich client
 # ---------------------------------------------------------------------------
 
@@ -158,8 +212,18 @@ class Immich:
                                  headers=self.headers)
             raise
 
-    def assets_missing_geo(self, limit=None):
-        """Yield IMAGE assets whose exif has no latitude/longitude."""
+    def assets_missing_geo(self, limit=None, asset_id=None):
+        """Yield IMAGE assets whose exif has no latitude/longitude.
+
+        If asset_id is provided, yield only that single asset (if missing geo).
+        """
+        if asset_id:
+            a = self.get_asset(asset_id)
+            exif = a.get("exifInfo") or {}
+            if a.get("type") == "IMAGE" and (exif.get("latitude") is None or exif.get("longitude") is None):
+                yield a
+            return
+
         page, yielded = 1, 0
         while True:
             data = self._search_metadata(page, 1000)
@@ -180,8 +244,29 @@ class Immich:
     def get_asset(self, asset_id):
         return http_json("GET", self._url("/assets/" + asset_id), headers=self.headers)
 
-    def preview_jpeg(self, asset_id):
-        """Return the preview-size JPEG (1440px) used for recognition."""
+    def preview_jpeg(self, asset_id, thumbs_dir=None):
+        """Return the preview-size JPEG (1440px) used for recognition.
+
+        If thumbs_dir is provided, try to read from local filesystem first.
+        """
+        if thumbs_dir:
+            # Try local thumb path: thumbs/<id[0:2]>/<id[2:4]>/<assetId>.jpeg
+            id_prefix = asset_id.replace("-", "")
+            thumb_path = os.path.join(
+                thumbs_dir,
+                id_prefix[0:2],
+                id_prefix[2:4],
+                asset_id + ".jpeg",
+            )
+            if os.path.exists(thumb_path):
+                with open(thumb_path, "rb") as f:
+                    return f.read()
+            # Fallback: try without dashes stripped
+            thumb_path2 = os.path.join(thumbs_dir, asset_id[0:2], asset_id[2:4], asset_id + ".jpeg")
+            if os.path.exists(thumb_path2):
+                with open(thumb_path2, "rb") as f:
+                    return f.read()
+
         url = self._url("/assets/{}/thumbnail?size=preview".format(asset_id))
         try:
             return http_bytes("GET", url, headers=self.headers)
@@ -282,121 +367,334 @@ def lens_locate(image_bytes, serpapi_key, email=None, max_matches=3):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Subcommand: scan
 # ---------------------------------------------------------------------------
 
-def process_asset(asset, preview, vision_key, serpapi_key, email, min_score,
-                  max_lens_matches):
-    """Return a result dict for one asset."""
-    result = {
-        "asset": asset,
-        "backend": None, "name": None, "score": None,
-        "lat": None, "lon": None, "detail": None, "error": None,
-    }
-    try:
-        hit = vision_landmark(preview, vision_key, min_score)
-        if hit:
-            result.update(backend="vision", name=hit[0], score=hit[1],
-                          lat=hit[2], lon=hit[3])
-            return result
-        if serpapi_key:
-            hit = lens_locate(preview, serpapi_key, email, max_lens_matches)
-            if hit:
-                result.update(backend="lens", name=hit[0], lat=hit[1], lon=hit[2],
-                             detail=hit[3])
-        return result
-    except ApiError as e:
-        result["error"] = str(e)
-        return result
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Fill in missing GPS coordinates in Immich "
-                    "(dry-run by default).")
-    parser.add_argument("--apply", action="store_true",
-                        help="write coordinates to Immich (default: dry run)")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="process at most N images")
-    parser.add_argument("--asset-id", default=None,
-                        help="process a single asset by id")
-    parser.add_argument("--min-score", type=float, default=0.5,
-                        help="minimum Cloud Vision landmark score (default 0.5)")
-    parser.add_argument("--max-lens-matches", type=int, default=3,
-                        help="Lens matches to try geocoding (default 3)")
-    args = parser.parse_args()
-
+def cmd_scan(args):
+    """List IMAGE assets whose exif has no latitude/longitude -> CSV rows."""
     load_env()
     immich_url = os.environ.get("IMMICH_URL", "")
     immich_key = os.environ.get("IMMICH_API_KEY", "")
-    vision_key = os.environ.get("GOOGLE_VISION_API_KEY", "")
-    serpapi_key = os.environ.get("SERPAPI_KEY", "")
-    email = os.environ.get("NOMINATIM_EMAIL")
 
     missing = [k for k, v in [("IMMICH_URL", immich_url),
-                              ("IMMICH_API_KEY", immich_key),
-                              ("GOOGLE_VISION_API_KEY", vision_key)] if not v]
+                              ("IMMICH_API_KEY", immich_key)] if not v]
     if missing:
         sys.exit("Missing configuration: {} (set them in the environment or in "
                  "{}/.env - see .env.example)".format(", ".join(missing), SCRIPT_DIR))
 
     immich = Immich(immich_url, immich_key)
 
-    if args.asset_id:
-        assets = [immich.get_asset(args.asset_id)]
-    else:
-        assets = immich.assets_missing_geo(limit=args.limit)
+    out_path = args.out or "geotag.csv"
 
-    mode = "APPLY" if args.apply else "DRY RUN"
-    print("immich-geotag [{}]  (vision{}{})".format(
-        mode, ", lens fallback" if serpapi_key else " only",
-        ", min_score={}".format(args.min_score)))
-    print("-" * 78)
+    # Read existing CSV to avoid duplicates
+    existing_rows = read_csv(out_path)
 
-    found = applied = errors = 0
-    for asset in assets:
+    new_rows = []
+    for asset in immich.assets_missing_geo(limit=args.limit, asset_id=args.asset_id):
         aid = asset["id"]
-        name = asset.get("originalFileName", aid)
-        try:
-            preview = immich.preview_jpeg(aid)
-        except ApiError as e:
-            print("{:40.40}  ERROR  {}".format(name, e))
-            errors += 1
+        # Skip if already in CSV
+        if asset_id_in_rows(existing_rows, aid):
+            continue
+        row = {
+            "asset_id": aid,
+            "file_name": asset.get("originalFileName", aid),
+            "latitude": "",
+            "longitude": "",
+            "place": "",
+            "source": "",
+            "score": "",
+            "status": "pending",
+            "maps_url": "",
+        }
+        new_rows.append(row)
+
+    # Append new rows to existing
+    all_rows = existing_rows + new_rows
+
+    if not new_rows:
+        print("No new missing-GPS assets found.")
+    else:
+        write_csv(out_path, all_rows)
+        print("Wrote {} new rows to {} (total: {})".format(len(new_rows), out_path, len(all_rows)))
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: recognize
+# ---------------------------------------------------------------------------
+
+def cmd_recognize(args):
+    """Run recognition on pending rows, fill coordinates. Never writes to Immich."""
+    load_env()
+    vision_key = os.environ.get("GOOGLE_VISION_API_KEY", "")
+    serpapi_key = os.environ.get("SERPAPI_KEY", "")
+    email = os.environ.get("NOMINATIM_EMAIL")
+
+    missing = [k for k, v in [("GOOGLE_VISION_API_KEY", vision_key)] if not v]
+    if missing:
+        sys.exit("Missing configuration: {} (set them in the environment or in "
+                 "{}/.env - see .env.example)".format(", ".join(missing), SCRIPT_DIR))
+
+    immich_url = os.environ.get("IMMICH_URL", "")
+    immich_key = os.environ.get("IMMICH_API_KEY", "")
+    immich = Immich(immich_url, immich_key) if immich_url and immich_key else None
+
+    csv_path = args.csv
+    if not os.path.exists(csv_path):
+        sys.exit("CSV file not found: {}".format(csv_path))
+
+    rows = read_csv(csv_path)
+    located = not_found = errors = skipped = 0
+
+    for i, row in enumerate(rows):
+        asset_id = row.get("asset_id", "")
+        status = row.get("status", "")
+        lat = row.get("latitude", "")
+        lon = row.get("longitude", "")
+
+        # Skip rows that already have coordinates
+        if lat and lon:
+            skipped += 1
+            continue
+        # Only process pending rows
+        if status != "pending":
+            skipped += 1
             continue
 
-        r = process_asset(asset, preview, vision_key, serpapi_key, email,
-                          args.min_score, args.max_lens_matches)
-        if r["error"]:
-            print("{:40.40}  ERROR  {}".format(name, r["error"]))
-            errors += 1
-            continue
-
-        if r["lat"] is None:
-            print("{:40.40}  no location found".format(name))
-            continue
-
-        found += 1
-        score = " score={:.2f}".format(r["score"]) if r["score"] is not None else ""
-        maps = "https://www.google.com/maps?q={:.5f},{:.5f}".format(r["lat"], r["lon"])
-        print("{:40.40}  [{}] {}{} -> {:.5f},{:.5f}".format(
-            name, r["backend"], r["name"] or "", score, r["lat"], r["lon"]))
-        if r["detail"]:
-            print("    geocoded as: {}".format(r["detail"]))
-        print("    check: {}".format(maps))
-
-        if args.apply:
+        # Get the preview image
+        preview = None
+        if immich:
             try:
-                immich.set_location(aid, r["lat"], r["lon"])
-                applied += 1
-                print("    written to Immich")
+                preview = immich.preview_jpeg(asset_id, thumbs_dir=args.thumbs)
             except ApiError as e:
-                print("    FAILED to write: {}".format(e))
+                print("{:40.40}  ERROR  {}".format(row.get("file_name", asset_id), e))
+                row["status"] = "error"
+                row["error"] = str(e)
+                rows[i] = row
+                write_csv(csv_path, rows)
+                errors += 1
+                continue
+        else:
+            # No Immich config, try --thumbs
+            if args.thumbs:
+                try:
+                    thumb_path = os.path.join(
+                        args.thumbs,
+                        asset_id.replace("-", "")[0:2],
+                        asset_id.replace("-", "")[2:4],
+                        asset_id + ".jpeg",
+                    )
+                    if os.path.exists(thumb_path):
+                        with open(thumb_path, "rb") as f:
+                            preview = f.read()
+                    else:
+                        thumb_path2 = os.path.join(args.thumbs, asset_id[0:2], asset_id[2:4], asset_id + ".jpeg")
+                        if os.path.exists(thumb_path2):
+                            with open(thumb_path2, "rb") as f:
+                                preview = f.read()
+                except Exception as e:
+                    pass
+
+        if preview is None:
+            print("{:40.40}  ERROR  cannot fetch preview image".format(row.get("file_name", asset_id)))
+            row["status"] = "error"
+            row["error"] = "cannot fetch preview"
+            rows[i] = row
+            write_csv(csv_path, rows)
+            errors += 1
+            continue
+
+        # Try Vision first
+        hit = vision_landmark(preview, vision_key, args.min_score)
+        if hit:
+            name, score, lat_val, lon_val = hit
+            row["latitude"] = str(lat_val) if lat_val is not None else ""
+            row["longitude"] = str(lon_val) if lon_val is not None else ""
+            row["place"] = name
+            row["source"] = "vision"
+            row["score"] = str(score) if score is not None else ""
+            row["status"] = "located"
+            row["maps_url"] = "https://www.google.com/maps?q={:.5f},{:.5f}".format(
+                lat_val, lon_val) if lat_val is not None and lon_val is not None else ""
+            rows[i] = row
+            write_csv(csv_path, rows)  # crash-safe: write after each row
+            located += 1
+            print("{:40.40}  [vision] {} score={:.2f} -> {:.5f},{:.5f}".format(
+                row.get("file_name", asset_id), name, score, lat_val, lon_val))
+            continue
+
+        # Try Lens fallback
+        if serpapi_key:
+            try:
+                hit = lens_locate(preview, serpapi_key, email, args.max_lens_matches)
+                if hit:
+                    name, lat_val, lon_val, detail = hit
+                    row["latitude"] = str(lat_val) if lat_val is not None else ""
+                    row["longitude"] = str(lon_val) if lon_val is not None else ""
+                    row["place"] = name
+                    row["source"] = "lens"
+                    row["score"] = ""
+                    row["status"] = "located"
+                    row["maps_url"] = "https://www.google.com/maps?q={:.5f},{:.5f}".format(
+                        lat_val, lon_val) if lat_val is not None and lon_val is not None else ""
+                    rows[i] = row
+                    write_csv(csv_path, rows)
+                    located += 1
+                    print("{:40.40}  [lens] {} -> {:.5f},{:.5f}".format(
+                        row.get("file_name", asset_id), name, lat_val, lon_val))
+                    print("    geocoded as: {}".format(detail))
+                    continue
+            except ApiError as e:
+                print("{:40.40}  ERROR  {}".format(row.get("file_name", asset_id), e))
+                row["status"] = "error"
+                row["error"] = str(e)
+                rows[i] = row
+                write_csv(csv_path, rows)
+                errors += 1
+                continue
+
+        # No match found
+        row["status"] = "not_found"
+        rows[i] = row
+        write_csv(csv_path, rows)
+        not_found += 1
+        print("{:40.40}  no location found".format(row.get("file_name", asset_id)))
+
+    print("-" * 78)
+    print("done: {} located, {} not_found, {} errors, {} skipped".format(
+        located, not_found, errors, skipped))
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: apply
+# ---------------------------------------------------------------------------
+
+def cmd_apply(args):
+    """Write approved rows back to Immich. Idempotent, --dry-run by default."""
+    load_env()
+    immich_url = os.environ.get("IMMICH_URL", "")
+    immich_key = os.environ.get("IMMICH_API_KEY", "")
+
+    missing = [k for k, v in [("IMMICH_URL", immich_url),
+                              ("IMMICH_API_KEY", immich_key)] if not v]
+    if missing:
+        sys.exit("Missing configuration: {} (set them in the environment or in "
+                 "{}/.env - see .env.example)".format(", ".join(missing), SCRIPT_DIR))
+
+    immich = Immich(immich_url, immich_key)
+
+    csv_path = args.csv
+    if not os.path.exists(csv_path):
+        sys.exit("CSV file not found: {}".format(csv_path))
+
+    rows = read_csv(csv_path)
+    dry_run = not args.apply
+    written = errors = skipped = 0
+
+    for i, row in enumerate(rows):
+        asset_id = row.get("asset_id", "")
+        status = row.get("status", "")
+        lat_str = row.get("latitude", "")
+        lon_str = row.get("longitude", "")
+
+        # Skip rows without coordinates
+        if not lat_str or not lon_str:
+            skipped += 1
+            continue
+
+        # Skip already applied rows
+        if status == "applied":
+            skipped += 1
+            continue
+
+        try:
+            lat = float(lat_str)
+            lon = float(lon_str)
+        except ValueError:
+            print("{:40.40}  ERROR  invalid coordinates: {},{}".format(
+                row.get("file_name", asset_id), lat_str, lon_str))
+            errors += 1
+            continue
+
+        if dry_run:
+            maps = row.get("maps_url", "")
+            source = row.get("source", "")
+            place = row.get("place", "")
+            print("WOULD WRITE: {:40.40}  [{}] {} -> {:.5f},{:.5f} {}".format(
+                row.get("file_name", asset_id), source, place, lat, lon, maps))
+            written += 1
+        else:
+            try:
+                immich.set_location(asset_id, lat, lon)
+                row["status"] = "applied"
+                rows[i] = row
+                write_csv(csv_path, rows)
+                print("WRITTEN:   {:40.40}  -> {:.5f},{:.5f}".format(
+                    row.get("file_name", asset_id), lat, lon))
+                written += 1
+            except ApiError as e:
+                print("FAILED:    {:40.40}  {}".format(
+                    row.get("file_name", asset_id), e))
                 errors += 1
 
     print("-" * 78)
-    print("done: {} located, {} written, {} errors{}".format(
-        found, applied, errors,
-        "" if args.apply else "  (dry run - nothing was written; use --apply)"))
+    if dry_run:
+        print("dry run: {} would be written, {} errors, {} skipped".format(
+            written, errors, skipped))
+        print("(use --apply to actually write to Immich)")
+    else:
+        print("done: {} written, {} errors, {} skipped".format(
+            written, errors, skipped))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fill in missing GPS coordinates in Immich.")
+    subparsers = parser.add_subparsers(dest="command", help="subcommand")
+
+    # scan subcommand
+    scan_parser = subparsers.add_parser("scan", help="List missing-GPS assets")
+    scan_parser.add_argument("--out", default=None,
+                             help="output CSV path (default: geotag.csv)")
+    scan_parser.add_argument("--limit", type=int, default=None,
+                             help="process at most N images")
+    scan_parser.add_argument("--asset-id", default=None,
+                             help="process a single asset by id")
+
+    # recognize subcommand
+    rec_parser = subparsers.add_parser("recognize", help="Run recognition on CSV rows")
+    rec_parser.add_argument("csv", help="CSV file path")
+    rec_parser.add_argument("--min-score", type=float, default=0.5,
+                             help="minimum Cloud Vision landmark score (default 0.5)")
+    rec_parser.add_argument("--max-lens-matches", type=int, default=3,
+                             help="Lens matches to try geocoding (default 3)")
+    rec_parser.add_argument("--thumbs", default=None,
+                             help="local thumbs directory (read previews from disk)")
+
+    # apply subcommand
+    app_parser = subparsers.add_parser("apply", help="Write coordinates to Immich")
+    app_parser.add_argument("csv", help="CSV file path")
+    app_parser.add_argument("--apply", action="store_true",
+                             help="actually write to Immich (default: dry run)")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.command == "scan":
+        cmd_scan(args)
+    elif args.command == "recognize":
+        cmd_recognize(args)
+    elif args.command == "apply":
+        cmd_apply(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

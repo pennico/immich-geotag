@@ -169,25 +169,32 @@ External APIs:
    keep `--asset-id` as a `scan` filter). Keep the existing functions:
    HTTP helpers, `Immich` class, `vision_landmark`, `lens_locate`,
    `nominatim_search`, `clean_match_title`, `load_env`.
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
 2. **CSV layer:** small read/write helpers (stdlib `csv` module). Read is
    tolerant: unknown columns ignored, missing optional columns treated as
    empty. Write preserves column order. UTF-8.
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
 3. **`scan`:** reuse `assets_missing_geo()`; write rows with empty
    coordinates, `status=pending`. `--out` defaults to `geotag.csv`;
    appending to an existing CSV must not duplicate `asset_id` rows.
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
 4. **`recognize`:** iterate rows where `status=pending` and coordinates
    empty; reuse `preview_jpeg()` (or `--thumbs` read), `vision_landmark()`,
    `lens_locate()`. Update rows in place, rewrite the CSV after each row
    (crash-safe: quota spent is never lost). Print a per-row line and an
    end summary (located / not_found / errors).
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
 5. **`apply`:** for rows with coordinates and `status != applied`, call
    `set_location()`; mark `status=applied` only after a successful PUT.
    `--dry-run` prints the plan without writes. Summary at the end.
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
 6. **`--thumbs DIR` mode (only if running on the server):** verify the
    thumbnail path layout against the installed Immich version first, then
    add a local-read branch in the preview fetch.
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
 7. **Tests:** extend the fake-payload smoke tests to the CSV layer
    (round-trip, resume-skip, apply idempotency, duplicate asset_id guard).
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90` (45 tests)
 8. **Live validation:** first real run with `scan --limit 5` +
    `recognize` against the actual server; eyeball every `maps_url` before
    the first `apply`.
