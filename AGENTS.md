@@ -67,16 +67,19 @@ The owner runs the first live pass locally: `scan --limit 5` →
 `recognize` → eyeball `maps_url` → `apply --dry-run` → `apply`. Make this
 checklist easy to find (README or PLAN section 7 already has it).
 
-## Handoff protocol (sessions cannot trigger each other)
+## Handoff protocol (unattended sessions)
 
-Cloud sessions are independent: you cannot launch, resume, or signal
-another session. The repo is the only coordination bus.
+All roles run headless, launched by the dispatcher; you cannot launch,
+resume, or signal another session. The repo is the only coordination bus.
 
 - End every PR with a **Handoff** section: what is done and verified, what
   the next session should pick up, and any decision the owner must make.
 - If you are blocked (question only the owner can answer, live validation
-  needed, work outside the build steps), **open a GitHub issue** describing
-  the blocker and stop cleanly. The owner sees the issue from his phone and
-  launches the next session pointed at it.
+  needed, work outside the build steps), **open a GitHub issue labeled
+  `blocker`** (`gh issue create --label blocker --title ... --body ...`)
+  and stop cleanly. The owner gets a push notification, answers in a
+  comment, and adds the `answered` label — the dispatcher then resumes
+  with your issue and the owner's answer quoted in the prompt. Close the
+  issue once your resumed session has resolved it.
 - Never wait idly for another agent — either proceed with work that is
   within your role, or stop with the issue filed.
