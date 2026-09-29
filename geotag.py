@@ -22,13 +22,14 @@ this script (see .env.example):
 
 Usage:
   python3 geotag.py scan --out geotag.csv [--limit N] [--asset-id UUID]
-  python3 geotag.py recognize geotag.csv [--min-score 0.5]
+  python3 geotag.py recognize geotag.csv [--min-score 0.5] [--thumbs DIR]
   python3 geotag.py apply geotag.csv [--dry-run]
 """
 
 import argparse
 import base64
 import csv
+import glob
 import io
 import json
 import os
@@ -187,6 +188,61 @@ def asset_id_in_rows(rows, asset_id):
 
 
 # ---------------------------------------------------------------------------
+# Local thumbnail reading (--thumbs DIR)
+# ---------------------------------------------------------------------------
+
+def read_local_thumb(thumbs_dir, asset_id):
+    """Read an asset's preview image from a local Immich thumbs directory.
+
+    Candidate layouts, verified against the Immich server source
+    (server/src/cores/storage.core.ts, tags v2.0.0 and v3.2.4; see PLAN.md
+    build step 6), newest first:
+
+      v3.x:  thumbs/<ownerId>/<id[0:2]>/<id[2:4]>/<id>_preview.<jpeg|webp>
+      v2.x:  thumbs/<ownerId>/<id[0:2]>/<id[2:4]>/<id>-preview.<jpeg|webp>
+      v1.x:  thumbs/<id[0:2]>/<id[2:4]>/<id>-preview.<jpeg|webp>
+
+    The CSV does not carry the ownerId, so the owner folder is matched with
+    a glob. The preview format is configurable on current servers, so both
+    .jpeg and .webp are tried. Returns the file bytes, or None when no
+    candidate exists.
+    """
+    if not thumbs_dir or not asset_id:
+        return None
+    shard1, shard2 = asset_id[0:2], asset_id[2:4]
+    exact = [
+        os.path.join(thumbs_dir, shard1, shard2,
+                     "{}_preview.jpeg".format(asset_id)),
+        os.path.join(thumbs_dir, shard1, shard2,
+                     "{}_preview.webp".format(asset_id)),
+        os.path.join(thumbs_dir, shard1, shard2,
+                     "{}-preview.jpeg".format(asset_id)),
+        os.path.join(thumbs_dir, shard1, shard2,
+                     "{}-preview.webp".format(asset_id)),
+        os.path.join(thumbs_dir, shard1, shard2, asset_id + ".jpeg"),
+    ]
+    patterns = [
+        os.path.join(thumbs_dir, "*", shard1, shard2,
+                     "{}_preview.jpeg".format(asset_id)),
+        os.path.join(thumbs_dir, "*", shard1, shard2,
+                     "{}_preview.webp".format(asset_id)),
+        os.path.join(thumbs_dir, "*", shard1, shard2,
+                     "{}-preview.jpeg".format(asset_id)),
+        os.path.join(thumbs_dir, "*", shard1, shard2,
+                     "{}-preview.webp".format(asset_id)),
+    ]
+    for path in exact:
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                return f.read()
+    for pattern in patterns:
+        for path in sorted(glob.glob(pattern)):
+            with open(path, "rb") as f:
+                return f.read()
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Immich client
 # ---------------------------------------------------------------------------
 
@@ -247,25 +303,13 @@ class Immich:
     def preview_jpeg(self, asset_id, thumbs_dir=None):
         """Return the preview-size JPEG (1440px) used for recognition.
 
-        If thumbs_dir is provided, try to read from local filesystem first.
+        If thumbs_dir is provided, read the local thumbnail file first
+        (see read_local_thumb) and fall back to the API when it is missing.
         """
         if thumbs_dir:
-            # Try local thumb path: thumbs/<id[0:2]>/<id[2:4]>/<assetId>.jpeg
-            id_prefix = asset_id.replace("-", "")
-            thumb_path = os.path.join(
-                thumbs_dir,
-                id_prefix[0:2],
-                id_prefix[2:4],
-                asset_id + ".jpeg",
-            )
-            if os.path.exists(thumb_path):
-                with open(thumb_path, "rb") as f:
-                    return f.read()
-            # Fallback: try without dashes stripped
-            thumb_path2 = os.path.join(thumbs_dir, asset_id[0:2], asset_id[2:4], asset_id + ".jpeg")
-            if os.path.exists(thumb_path2):
-                with open(thumb_path2, "rb") as f:
-                    return f.read()
+            data = read_local_thumb(thumbs_dir, asset_id)
+            if data is not None:
+                return data
 
         url = self._url("/assets/{}/thumbnail?size=preview".format(asset_id))
         try:
@@ -470,25 +514,9 @@ def cmd_recognize(args):
                 errors += 1
                 continue
         else:
-            # No Immich config, try --thumbs
+            # No Immich config: --thumbs is the only image source
             if args.thumbs:
-                try:
-                    thumb_path = os.path.join(
-                        args.thumbs,
-                        asset_id.replace("-", "")[0:2],
-                        asset_id.replace("-", "")[2:4],
-                        asset_id + ".jpeg",
-                    )
-                    if os.path.exists(thumb_path):
-                        with open(thumb_path, "rb") as f:
-                            preview = f.read()
-                    else:
-                        thumb_path2 = os.path.join(args.thumbs, asset_id[0:2], asset_id[2:4], asset_id + ".jpeg")
-                        if os.path.exists(thumb_path2):
-                            with open(thumb_path2, "rb") as f:
-                                preview = f.read()
-                except Exception as e:
-                    pass
+                preview = read_local_thumb(args.thumbs, asset_id)
 
         if preview is None:
             print("{:40.40}  ERROR  cannot fetch preview image".format(row.get("file_name", asset_id)))
@@ -661,7 +689,9 @@ def main():
     rec_parser.add_argument("--max-lens-matches", type=int, default=3,
                              help="Lens matches to try geocoding (default 3)")
     rec_parser.add_argument("--thumbs", default=None,
-                             help="local thumbs directory (read previews from disk)")
+                             help="local Immich thumbs/ directory: read preview "
+                                  "images from disk instead of the API (for runs "
+                                  "on the server itself)")
 
     # apply subcommand
     app_parser = subparsers.add_parser("apply", help="Write coordinates to Immich")
