@@ -18,9 +18,15 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
      task sessions -> the issue gains the `blocker` label and the repo
      pauses.
   4. If open PRs exist:
-       - merge approved PRs with green checks first (squash, delete branch);
-       - any remaining PR without the `approved` label -> run a QA session.
-         Two QA passes on the same PR without approval -> blocker + pause.
+       - merge PRs with BOTH review labels (`approved` + `approved-adversarial`)
+         and green checks first (squash, delete branch);
+       - two-reviewer pipeline, one review session per tick: a PR lacking
+         `approved` gets a correctness (QA) review; a PR with `approved`
+         but lacking `approved-adversarial` gets an adversarial review.
+         A failed review (label not added) triggers a rework session on
+         the PR (impl role, addresses the review comments) and invalidates
+         prior approvals. Two failed review rounds on the same PR ->
+         blocker + pause.
   5. Else: run an Implementation session on the first unchecked ROADMAP.md
      item (a role tag in the item text selects the prompt; default impl).
   6. Else: idle (roadmap complete) -> notify once.
@@ -71,6 +77,7 @@ FAIL_STRIKES = 2   # failed sessions per roadmap item before pausing
 QA_STRIKES = 2     # QA passes per PR without approval before pausing
 LOOP_SETTLE_S = 30  # pause between sessions in --loop mode
 REPO_NAME = "immich-geotag"
+ADV_LABEL = "approved-adversarial"
 
 IMPL_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
 Read AGENTS.md first, then PLAN.md — it is the complete approved spec.
@@ -86,22 +93,55 @@ outside the build steps), open a GitHub issue labeled `blocker`
 (`gh issue create --label blocker`) and stop cleanly. When done: push the
 branch, then `git checkout main` so the working tree is left clean."""
 
-QA_PROMPT = """You are the QA agent for this repository (unattended headless run).
-Read AGENTS.md first. Open pull requests need review. For each open PR
-(`gh pr list`, `gh pr view N`, `gh pr diff N`):
+QA_PROMPT = """You are the QA (correctness) agent for this repository (unattended headless run).
+Read AGENTS.md first. Open pull requests need correctness review. For each open PR
+lacking the `approved` label (`gh pr list`, `gh pr view N`, `gh pr diff N`):
 - Check the PR against AGENTS.md (hard constraints, style, decision defaults)
   and PLAN.md's target design. Pay special attention to: apply must stay
   behind the dry-run/CSV review flow, no live API calls in tests, no
   personal data (.env, CSVs, photos) committed.
 - Run the project's tests if present; keep total runtime under ~25 minutes.
+- Reproduce first: report only problems you can demonstrate (command +
+  output in the comment). Speculative concerns go in a clearly marked
+  "notes" section, never as findings.
 - If the PR is good: `gh pr ready N` (if still a draft), then
   `gh label create approved --color 0E8A16 2>/dev/null || true` and
   `gh pr edit N --add-label approved`.
 - If the PR has problems: `gh pr review N --comment --body "..."` with
-  concrete findings, and do NOT add the label. If the problems need an
-  owner decision, say so explicitly in the comment.
+  concrete, reproduced findings, and do NOT add the label. If the problems
+  need an owner decision, say so explicitly in the comment.
 Do not merge PRs yourself. Do not modify code. When done: `git checkout main`
 so the working tree is left clean."""
+
+ADV_PROMPT = """You are the Adversarial reviewer for this repository (unattended headless run).
+Your job is to break the PR, not to admire it. Read AGENTS.md first. For each
+open PR that has the `approved` label but lacks `approved-adversarial`
+(`gh pr list`, `gh pr view N`, `gh pr diff N`):
+- Hunt for what a correctness review plausibly missed: edge cases (empty
+  or unicode input, huge values, concurrent runs, missing files), error
+  handling and failure paths, security (injection, path traversal, unsafe
+  deserialization, secret handling), resource leaks, and violations of the
+  AGENTS.md hard constraints.
+- Reproduce first: every finding must include the command you ran and its
+  actual output. If you cannot reproduce it, it is a "note", not a finding.
+- If the PR survives: `gh label create approved-adversarial --color 5319E7
+  2>/dev/null || true` and `gh pr edit N --add-label approved-adversarial`.
+- If you found reproduced problems: `gh pr review N --comment --body "..."`
+  with the reproductions, and do NOT add the label. If the problems need
+  an owner decision, say so explicitly in the comment.
+Do not merge PRs yourself. Do not modify code. When done: `git checkout main`
+so the working tree is left clean."""
+
+REWORK_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
+PR #{number} "{title}" failed review. Read AGENTS.md first. Then read the
+review findings: `gh pr view {number} --comments` and `gh pr diff {number}`.
+- `gh pr checkout {number}` to get the PR branch.
+- Reproduce each reported finding locally, fix it, and push to the PR
+  branch. Keep the fix minimal and focused on the findings; no drive-by
+  refactors.
+- Do not remove review labels, do not add labels, do not merge.
+When done: push the branch, then `git checkout main` so the working tree is
+left clean."""
 
 RESUME_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
 The owner has answered blocker issue #{number}: "{title}"
@@ -192,12 +232,20 @@ def maybe_save(state, dry):
 
 def ensure_labels():
     for name, color in (("approved", "0E8A16"), ("blocker", "D93F0B"),
-                        ("answered", "FBCA04"), ("task", "1D76DB")):
+                        ("answered", "FBCA04"), ("task", "1D76DB"),
+                        ("approved-adversarial", "5319E7")):
         run(["gh", "label", "create", name, "--color", color])
 
 
 def open_prs():
     return gh_json(["gh", "pr", "list", "--json", "number,title,labels,url,isDraft"])
+
+
+def pr_labels(number):
+    data = gh_json(["gh", "pr", "view", str(number), "--json", "labels"])
+    if data is None:
+        return None
+    return {l["name"] for l in data.get("labels", [])}
 
 
 def checks_pass(number):
@@ -506,15 +554,17 @@ def tick(dry):
                               f"#{p['number']} {p['title']}",
                               tags="envelope", url=p.get("url"))
     if prs:
-        # Merge approved + green PRs first (cheap gh calls, no session),
-        # so ready work is not held up by PRs still under review.
+        # Merge PRs with BOTH review labels + green checks first (cheap gh
+        # calls, no session), so ready work is not held up by PRs still
+        # under review.
         waiting = False
         for p in prs:
-            if "approved" not in {l["name"] for l in p["labels"]}:
+            labels = {l["name"] for l in p["labels"]}
+            if "approved" not in labels or ADV_LABEL not in labels:
                 continue
             if p["number"] not in state["approved_prs"]:
                 state["approved_prs"].append(p["number"])
-                log(f"PR #{p['number']} approved")
+                log(f"PR #{p['number']} approved by both reviewers")
                 if not dry:
                     notify.notify(f"{REPO_NAME}: PR approved",
                                   f"#{p['number']} {p['title']} — will merge",
@@ -540,35 +590,64 @@ def tick(dry):
                     notify.notify(f"{REPO_NAME}: merge failed",
                                   f"#{p['number']} {p['title']} — merge error, needs a look",
                                   priority="high", tags="warning", url=p.get("url"))
-        unapproved = [p for p in prs
-                      if "approved" not in {l["name"] for l in p["labels"]}]
-        if unapproved:
-            pause = False
-            for p in unapproved:
-                strikes = state["qa_strikes"].get(str(p["number"]), 0) + 1
-                state["qa_strikes"][str(p["number"])] = strikes
-                if strikes > QA_STRIKES:
-                    log(f"PR #{p['number']} not approved after {QA_STRIKES} QA passes; pausing")
-                    if not dry:
-                        n = file_blocker(
-                            f"PR #{p['number']} failed QA twice: {p['title']}",
-                            "The QA agent reviewed this PR twice without adding the "
-                            "`approved` label (see the PR review comments). The "
-                            "dispatcher paused this repo. Please take a look, then "
-                            "comment here and add the `answered` label to resume.")
-                        if n:
-                            state["seen_blockers"].append(n)
-                            notify.notify(f"{REPO_NAME}: paused",
-                                          f"PR #{p['number']} failed QA twice — needs a look",
-                                          priority="high", tags="warning", url=p.get("url"))
-                    pause = True
-            if pause:
+        # Two-reviewer pipeline: one review session per tick. Correctness
+        # (QA) first; adversarial only after correctness approved.
+        in_review = [p for p in prs
+                     if "approved" not in {l["name"] for l in p["labels"]}
+                     or ADV_LABEL not in {l["name"] for l in p["labels"]}]
+        if in_review:
+            corr = [p for p in in_review
+                    if "approved" not in {l["name"] for l in p["labels"]}]
+            if corr:
+                role, prompt, label = "qa", QA_PROMPT, "approved"
+                targets = corr
+            else:
+                role, prompt, label = "adv", ADV_PROMPT, ADV_LABEL
+                targets = in_review
+            log(f"PRs needing {role} review: {[p['number'] for p in targets]}")
+            if dry:
                 maybe_save(state, dry)
-                return "blocked"
-            log(f"PRs needing QA: {[p['number'] for p in unapproved]}")
+                return "worked"
             maybe_save(state, dry)
-            if not dry:
-                run_session("qa", QA_PROMPT)
+            code = run_session(role, prompt)
+            if code is None:
+                return "abort"
+            pause = False
+            for p in targets:
+                n = p["number"]
+                after = pr_labels(n)
+                if after is None:
+                    return "abort"
+                if label in after:
+                    state["qa_strikes"].pop(str(n), None)
+                    continue
+                strikes = state["qa_strikes"].get(str(n), 0) + 1
+                state["qa_strikes"][str(n)] = strikes
+                if strikes > QA_STRIKES:
+                    log(f"PR #{n} failed review after rework rounds; pausing")
+                    b = file_blocker(
+                        f"PR #{n} failed review after rework rounds: {p['title']}",
+                        f"This PR failed {QA_STRIKES} review rounds (label "
+                        f"`{label}` not added; see the PR review comments), "
+                        "each followed by a rework session. The dispatcher "
+                        "paused this repo. Please take a look, then comment "
+                        "here and add the `answered` label to resume.")
+                    if b:
+                        state["seen_blockers"].append(b)
+                        notify.notify(f"{REPO_NAME}: paused",
+                                      f"PR #{n} failed review after rework — needs a look",
+                                      priority="high", tags="warning", url=p.get("url"))
+                    pause = True
+                    continue
+                log(f"PR #{n} failed {role} review (strike {strikes}); launching rework")
+                run_session("impl", REWORK_PROMPT.format(
+                    number=n, title=p["title"]))
+                if "approved" in after:
+                    run(["gh", "pr", "edit", str(n), "--remove-label", "approved"])
+                    log(f"PR #{n}: removed `approved` (code changed in rework)")
+            maybe_save(state, dry)
+            if pause:
+                return "blocked"
             return "worked"
         maybe_save(state, dry)
         return "waiting" if waiting else "worked"
