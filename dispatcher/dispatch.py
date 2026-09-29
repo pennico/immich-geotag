@@ -112,9 +112,11 @@ branch, then `git checkout main` so the working tree is left clean."""
 
 PROMPTS = {"impl": IMPL_PROMPT, "qa": QA_PROMPT}
 
-STASH_NOTE = ("\n\nNote: a previous session on this repo was interrupted and "
-              "its uncommitted work was stashed (`git stash list`, most "
-              "recent entry). Inspect it and reuse anything useful before "
+STASH_NOTE = ("\n\nNote: a previous session on this repo was interrupted. Its "
+              "uncommitted work, if any, is in `git stash list` (most recent "
+              "entry), and it may have left commits on an unpushed local "
+              "branch (`git branch --no-merged main`, branches without an "
+              "upstream). Inspect both and reuse anything useful before "
               "redoing work from scratch.")
 
 # --- gentle shutdown (SIGTERM) machinery ---
@@ -234,26 +236,53 @@ def first_roadmap_item():
     return None, None
 
 
-def recover_dirty_tree():
-    """Stash a dirty tree left by an interrupted session (crash or SIGTERM).
+def interrupted_branches():
+    """Unpushed local branches with commits not on main.
 
-    Returns True if a stash was created. The pending flag in state.json
-    makes the next implementation session aware it can reuse that work.
+    Sessions commit incrementally on a branch and push only at the end,
+    so an interrupted session's work usually sits here rather than in the
+    working tree.
     """
+    r = run(["git", "branch", "--no-merged", "main", "--format",
+             "%(refname:short)|%(upstream)"])
+    branches = []
+    for line in (r.stdout or "").splitlines():
+        name, _, upstream = line.partition("|")
+        name = name.strip()
+        if name and name != "main" and not upstream.strip():
+            branches.append(name)
+    return branches
+
+
+def recover_dirty_tree():
+    """Preserve work left by an interrupted session (crash or SIGTERM).
+
+    Stashes uncommitted changes and notes unpushed local branches; the
+    pending flag in state.json makes the next implementation session's
+    prompt point at both. Returns True if anything was found.
+    """
+    found = False
     status = run(["git", "status", "--porcelain"])
-    if not status.stdout.strip():
-        return False
-    stashed = run(["git", "stash", "-u"])
-    if stashed.returncode != 0:
-        log(f"could not stash dirty tree: {stashed.stderr.strip()[:200]}")
+    if status.stdout.strip():
+        stashed = run(["git", "stash", "-u"])
+        if stashed.returncode != 0:
+            log(f"could not stash dirty tree: {stashed.stderr.strip()[:200]}")
+        else:
+            log("stashed uncommitted changes from an interrupted session")
+            found = True
+    branches = interrupted_branches()
+    if branches:
+        log(f"unpushed branches from an interrupted session: {branches}")
+        found = True
+    if not found:
         return False
     state = load_state()
     state["stash_note_pending"] = True
     save_state(state)
-    log("stashed uncommitted changes from an interrupted session")
-    notify.notify(f"{REPO_NAME}: recovered dirty working tree",
-                  "Stashed uncommitted changes left by an interrupted "
-                  "session; see `git stash list` in the clone.",
+    notify.notify(f"{REPO_NAME}: recovered work from an interrupted session",
+                  "Stashed uncommitted changes and/or found unpushed "
+                  "branches; see `git stash list` and `git branch` in the "
+                  "clone.",
                   tags="warning")
     return True
 
@@ -308,12 +337,12 @@ def tick(dry):
     'blocked' (waiting for the owner), 'waiting' (approved PR, checks not
     green yet), or 'abort'.
     """
-    status = run(["git", "status", "--porcelain"])
-    if status.stdout.strip():
-        if dry:
+    if dry:
+        if run(["git", "status", "--porcelain"]).stdout.strip():
             log("ABORT: working tree not clean")
             return "abort"
-        recover_dirty_tree()
+    else:
+        recover_dirty_tree()  # stash + unpushed-branch check; no-op when clean
     run(["git", "checkout", "main"])
     pull = run(["git", "pull", "--ff-only"])
     if pull.returncode != 0:
