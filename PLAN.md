@@ -210,7 +210,10 @@ External APIs:
    thumb still falls back to the API download.
 7. **Tests:** extend the fake-payload smoke tests to the CSV layer
    (round-trip, resume-skip, apply idempotency, duplicate asset_id guard).
-   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90` (45 tests)
+   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`, extended in
+   Chunks 2-3; Chunk 4 (`vibe/test-suite-chunk4`) audited the suite against
+   the original 19 smoke checks and closed the last two gaps (multipart
+   upload body, `.env` loading) — 66 tests.
 8. **Live validation:** first real run with `scan --limit 5` +
    `recognize` against the actual server; eyeball every `maps_url` before
    the first `apply`.
