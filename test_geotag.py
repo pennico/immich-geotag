@@ -628,6 +628,189 @@ class TestRecognizeWorkflow(unittest.TestCase):
         rows_after = read_csv(csv_path)
         self.assertEqual(rows_after[0]["status"], "applied")  # unchanged
 
+    def _recognize_args(self, csv_path):
+        import argparse
+        return argparse.Namespace(
+            csv=csv_path,
+            min_score=0.5,
+            max_lens_matches=3,
+            thumbs=None,
+        )
+
+    def test_recognize_vision_locates_row(self):
+        """Vision hit fills coordinates, status=located, and persists to CSV."""
+        csv_path = os.path.join(self.tmpdir, "test.csv")
+        rows = [
+            {"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+             "longitude": "", "place": "", "source": "",
+             "score": "", "status": "pending", "maps_url": ""},
+        ]
+        write_csv(csv_path, rows)
+
+        from geotag import cmd_recognize
+        args = self._recognize_args(csv_path)
+
+        with mock.patch.dict(os.environ, {
+            "GOOGLE_VISION_API_KEY": "test-vision-key",
+            "IMMICH_URL": "https://immich.example.com",
+            "IMMICH_API_KEY": "test-key",
+        }):
+            with mock.patch("geotag.load_env"):
+                with mock.patch("geotag.Immich") as mock_immich_class:
+                    mock_immich = mock_immich_class.return_value
+                    mock_immich.preview_jpeg.return_value = FAKE_PREVIEW_JPEG
+                    with mock.patch("geotag.vision_landmark") as mock_vision:
+                        mock_vision.return_value = (
+                            "Eiffel Tower", 0.95, 48.85837, 2.294481)
+                        cmd_recognize(args)
+
+        rows_after = read_csv(csv_path)
+        self.assertEqual(rows_after[0]["status"], "located")
+        self.assertEqual(rows_after[0]["latitude"], "48.85837")
+        self.assertEqual(rows_after[0]["longitude"], "2.294481")
+        self.assertEqual(rows_after[0]["place"], "Eiffel Tower")
+        self.assertEqual(rows_after[0]["source"], "vision")
+        self.assertEqual(rows_after[0]["score"], "0.95")
+        self.assertIn("48.85837,2.29448", rows_after[0]["maps_url"])
+
+    def test_recognize_not_found(self):
+        """No Vision match and no SerpApi key -> status=not_found."""
+        csv_path = os.path.join(self.tmpdir, "test.csv")
+        rows = [
+            {"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+             "longitude": "", "place": "", "source": "",
+             "score": "", "status": "pending", "maps_url": ""},
+        ]
+        write_csv(csv_path, rows)
+
+        from geotag import cmd_recognize
+        args = self._recognize_args(csv_path)
+
+        with mock.patch.dict(os.environ, {
+            "GOOGLE_VISION_API_KEY": "test-vision-key",
+            "IMMICH_URL": "https://immich.example.com",
+            "IMMICH_API_KEY": "test-key",
+            "SERPAPI_KEY": "",
+        }):
+            with mock.patch("geotag.load_env"):
+                with mock.patch("geotag.Immich") as mock_immich_class:
+                    mock_immich = mock_immich_class.return_value
+                    mock_immich.preview_jpeg.return_value = FAKE_PREVIEW_JPEG
+                    with mock.patch("geotag.vision_landmark") as mock_vision:
+                        mock_vision.return_value = None
+                        cmd_recognize(args)
+
+        rows_after = read_csv(csv_path)
+        self.assertEqual(rows_after[0]["status"], "not_found")
+        self.assertEqual(rows_after[0]["latitude"], "")
+
+    def test_recognize_lens_fallback(self):
+        """Vision miss + SERPAPI_KEY -> Lens fallback fills source=lens."""
+        csv_path = os.path.join(self.tmpdir, "test.csv")
+        rows = [
+            {"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+             "longitude": "", "place": "", "source": "",
+             "score": "", "status": "pending", "maps_url": ""},
+        ]
+        write_csv(csv_path, rows)
+
+        from geotag import cmd_recognize
+        args = self._recognize_args(csv_path)
+
+        with mock.patch.dict(os.environ, {
+            "GOOGLE_VISION_API_KEY": "test-vision-key",
+            "IMMICH_URL": "https://immich.example.com",
+            "IMMICH_API_KEY": "test-key",
+            "SERPAPI_KEY": "test-serpapi-key",
+        }):
+            with mock.patch("geotag.load_env"):
+                with mock.patch("geotag.Immich") as mock_immich_class:
+                    mock_immich = mock_immich_class.return_value
+                    mock_immich.preview_jpeg.return_value = FAKE_PREVIEW_JPEG
+                    with mock.patch("geotag.vision_landmark") as mock_vision:
+                        mock_vision.return_value = None
+                        with mock.patch("geotag.lens_locate") as mock_lens:
+                            mock_lens.return_value = (
+                                "Eiffel Tower", 48.85837, 2.294481,
+                                "Eiffel Tower, Paris, France")
+                            cmd_recognize(args)
+
+        rows_after = read_csv(csv_path)
+        self.assertEqual(rows_after[0]["status"], "located")
+        self.assertEqual(rows_after[0]["source"], "lens")
+        self.assertEqual(rows_after[0]["latitude"], "48.85837")
+        self.assertEqual(rows_after[0]["score"], "")
+
+    def test_recognize_error_keeps_row_pending(self):
+        """A per-row error counts as an error and leaves the row pending (retryable)."""
+        csv_path = os.path.join(self.tmpdir, "test.csv")
+        rows = [
+            {"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+             "longitude": "", "place": "", "source": "",
+             "score": "", "status": "pending", "maps_url": ""},
+        ]
+        write_csv(csv_path, rows)
+
+        from geotag import cmd_recognize
+        args = self._recognize_args(csv_path)
+
+        with mock.patch.dict(os.environ, {
+            "GOOGLE_VISION_API_KEY": "test-vision-key",
+            "IMMICH_URL": "https://immich.example.com",
+            "IMMICH_API_KEY": "test-key",
+        }):
+            with mock.patch("geotag.load_env"):
+                with mock.patch("geotag.Immich") as mock_immich_class:
+                    mock_immich = mock_immich_class.return_value
+                    mock_immich.preview_jpeg.side_effect = ApiError("HTTP 500")
+                    cmd_recognize(args)
+
+        rows_after = read_csv(csv_path)
+        self.assertEqual(rows_after[0]["status"], "pending")
+        # No stray columns added to the schema
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            header = f.readline().strip()
+        self.assertEqual(header.split(","), CSV_COLUMNS)
+
+    def test_recognize_crash_safe_rewrite(self):
+        """CSV is rewritten after each row: a crash mid-run loses no completed rows."""
+        csv_path = os.path.join(self.tmpdir, "test.csv")
+        rows = [
+            {"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+             "longitude": "", "place": "", "source": "",
+             "score": "", "status": "pending", "maps_url": ""},
+            {"asset_id": "a2", "file_name": "f2.jpg", "latitude": "",
+             "longitude": "", "place": "", "source": "",
+             "score": "", "status": "pending", "maps_url": ""},
+        ]
+        write_csv(csv_path, rows)
+
+        from geotag import cmd_recognize
+        args = self._recognize_args(csv_path)
+
+        with mock.patch.dict(os.environ, {
+            "GOOGLE_VISION_API_KEY": "test-vision-key",
+            "IMMICH_URL": "https://immich.example.com",
+            "IMMICH_API_KEY": "test-key",
+        }):
+            with mock.patch("geotag.load_env"):
+                with mock.patch("geotag.Immich") as mock_immich_class:
+                    mock_immich = mock_immich_class.return_value
+                    mock_immich.preview_jpeg.return_value = FAKE_PREVIEW_JPEG
+                    with mock.patch("geotag.vision_landmark") as mock_vision:
+                        mock_vision.side_effect = [
+                            ("Eiffel Tower", 0.95, 48.85837, 2.294481),
+                            RuntimeError("simulated crash"),
+                        ]
+                        with self.assertRaises(RuntimeError):
+                            cmd_recognize(args)
+
+        # Row a1 was completed and persisted before the crash; a2 untouched
+        rows_after = read_csv(csv_path)
+        self.assertEqual(rows_after[0]["status"], "located")
+        self.assertEqual(rows_after[0]["latitude"], "48.85837")
+        self.assertEqual(rows_after[1]["status"], "pending")
+
 
 class TestApplyWorkflow(unittest.TestCase):
     """Test apply subcommand behavior."""
@@ -650,7 +833,7 @@ class TestApplyWorkflow(unittest.TestCase):
 
         from geotag import cmd_apply
         import argparse
-        args = argparse.Namespace(csv=csv_path, apply=False)
+        args = argparse.Namespace(csv=csv_path, dry_run=True)
 
         with mock.patch.dict(os.environ, {
             "IMMICH_URL": "https://immich.example.com",
@@ -680,7 +863,7 @@ class TestApplyWorkflow(unittest.TestCase):
 
         from geotag import cmd_apply
         import argparse
-        args = argparse.Namespace(csv=csv_path, apply=True)
+        args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
             "IMMICH_URL": "https://immich.example.com",
@@ -705,7 +888,7 @@ class TestApplyWorkflow(unittest.TestCase):
 
         from geotag import cmd_apply
         import argparse
-        args = argparse.Namespace(csv=csv_path, apply=True)
+        args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
             "IMMICH_URL": "https://immich.example.com",
@@ -730,7 +913,7 @@ class TestApplyWorkflow(unittest.TestCase):
 
         from geotag import cmd_apply
         import argparse
-        args = argparse.Namespace(csv=csv_path, apply=True)
+        args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
             "IMMICH_URL": "https://immich.example.com",
@@ -764,7 +947,7 @@ class TestApplyWorkflow(unittest.TestCase):
 
         from geotag import cmd_apply
         import argparse
-        args = argparse.Namespace(csv=csv_path, apply=True)
+        args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
             "IMMICH_URL": "https://immich.example.com",
@@ -782,6 +965,61 @@ class TestApplyWorkflow(unittest.TestCase):
 
         self.assertEqual(call_count_1, 0)  # Already applied, skipped
         self.assertEqual(call_count_2, 0)  # Still skipped
+
+    def test_apply_put_failure_not_marked_applied(self):
+        """A failed PUT leaves the row un-applied so a re-run retries it."""
+        csv_path = os.path.join(self.tmpdir, "test.csv")
+        rows = [
+            {"asset_id": "a1", "file_name": "f1.jpg", "latitude": "48.85837",
+             "longitude": "2.294481", "place": "Eiffel Tower", "source": "vision",
+             "score": "0.95", "status": "located", "maps_url": "url1"},
+        ]
+        write_csv(csv_path, rows)
+
+        from geotag import cmd_apply
+        import argparse
+        args = argparse.Namespace(csv=csv_path, dry_run=False)
+
+        with mock.patch.dict(os.environ, {
+            "IMMICH_URL": "https://immich.example.com",
+            "IMMICH_API_KEY": "test-key",
+        }):
+            with mock.patch("geotag.load_env"):
+                with mock.patch("geotag.Immich") as mock_immich_class:
+                    mock_immich = mock_immich_class.return_value
+                    mock_immich.set_location.side_effect = ApiError("HTTP 500")
+                    cmd_apply(args)
+
+        mock_immich.set_location.assert_called_once()
+        rows_after = read_csv(csv_path)
+        self.assertEqual(rows_after[0]["status"], "located")  # not marked applied
+
+    def test_apply_invalid_coordinates(self):
+        """Rows with unparseable coordinates are counted as errors, not written."""
+        csv_path = os.path.join(self.tmpdir, "test.csv")
+        rows = [
+            {"asset_id": "a1", "file_name": "f1.jpg", "latitude": "not-a-number",
+             "longitude": "2.294481", "place": "", "source": "manual",
+             "score": "", "status": "located", "maps_url": ""},
+        ]
+        write_csv(csv_path, rows)
+
+        from geotag import cmd_apply
+        import argparse
+        args = argparse.Namespace(csv=csv_path, dry_run=False)
+
+        with mock.patch.dict(os.environ, {
+            "IMMICH_URL": "https://immich.example.com",
+            "IMMICH_API_KEY": "test-key",
+        }):
+            with mock.patch("geotag.load_env"):
+                with mock.patch("geotag.Immich") as mock_immich_class:
+                    mock_immich = mock_immich_class.return_value
+                    cmd_apply(args)
+
+        mock_immich.set_location.assert_not_called()
+        rows_after = read_csv(csv_path)
+        self.assertEqual(rows_after[0]["status"], "located")
 
 
 class TestDuplicateAssetIdGuard(unittest.TestCase):
