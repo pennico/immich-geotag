@@ -445,7 +445,7 @@ def cmd_recognize(args):
     rows = read_csv(csv_path)
     located = not_found = errors = skipped = 0
 
-    for i, row in enumerate(rows):
+    for row in rows:
         asset_id = row.get("asset_id", "")
         status = row.get("status", "")
         lat = row.get("latitude", "")
@@ -467,10 +467,6 @@ def cmd_recognize(args):
                 preview = immich.preview_jpeg(asset_id, thumbs_dir=args.thumbs)
             except ApiError as e:
                 print("{:40.40}  ERROR  {}".format(row.get("file_name", asset_id), e))
-                row["status"] = "error"
-                row["error"] = str(e)
-                rows[i] = row
-                write_csv(csv_path, rows)
                 errors += 1
                 continue
         else:
@@ -496,15 +492,16 @@ def cmd_recognize(args):
 
         if preview is None:
             print("{:40.40}  ERROR  cannot fetch preview image".format(row.get("file_name", asset_id)))
-            row["status"] = "error"
-            row["error"] = "cannot fetch preview"
-            rows[i] = row
-            write_csv(csv_path, rows)
             errors += 1
             continue
 
         # Try Vision first
-        hit = vision_landmark(preview, vision_key, args.min_score)
+        try:
+            hit = vision_landmark(preview, vision_key, args.min_score)
+        except ApiError as e:
+            print("{:40.40}  ERROR  {}".format(row.get("file_name", asset_id), e))
+            errors += 1
+            continue
         if hit:
             name, score, lat_val, lon_val = hit
             row["latitude"] = str(lat_val) if lat_val is not None else ""
@@ -515,7 +512,6 @@ def cmd_recognize(args):
             row["status"] = "located"
             row["maps_url"] = "https://www.google.com/maps?q={:.5f},{:.5f}".format(
                 lat_val, lon_val) if lat_val is not None and lon_val is not None else ""
-            rows[i] = row
             write_csv(csv_path, rows)  # crash-safe: write after each row
             located += 1
             print("{:40.40}  [vision] {} score={:.2f} -> {:.5f},{:.5f}".format(
@@ -526,36 +522,30 @@ def cmd_recognize(args):
         if serpapi_key:
             try:
                 hit = lens_locate(preview, serpapi_key, email, args.max_lens_matches)
-                if hit:
-                    name, lat_val, lon_val, detail = hit
-                    row["latitude"] = str(lat_val) if lat_val is not None else ""
-                    row["longitude"] = str(lon_val) if lon_val is not None else ""
-                    row["place"] = name
-                    row["source"] = "lens"
-                    row["score"] = ""
-                    row["status"] = "located"
-                    row["maps_url"] = "https://www.google.com/maps?q={:.5f},{:.5f}".format(
-                        lat_val, lon_val) if lat_val is not None and lon_val is not None else ""
-                    rows[i] = row
-                    write_csv(csv_path, rows)
-                    located += 1
-                    print("{:40.40}  [lens] {} -> {:.5f},{:.5f}".format(
-                        row.get("file_name", asset_id), name, lat_val, lon_val))
-                    print("    geocoded as: {}".format(detail))
-                    continue
             except ApiError as e:
                 print("{:40.40}  ERROR  {}".format(row.get("file_name", asset_id), e))
-                row["status"] = "error"
-                row["error"] = str(e)
-                rows[i] = row
-                write_csv(csv_path, rows)
                 errors += 1
+                continue
+            if hit:
+                name, lat_val, lon_val, detail = hit
+                row["latitude"] = str(lat_val) if lat_val is not None else ""
+                row["longitude"] = str(lon_val) if lon_val is not None else ""
+                row["place"] = name
+                row["source"] = "lens"
+                row["score"] = ""
+                row["status"] = "located"
+                row["maps_url"] = "https://www.google.com/maps?q={:.5f},{:.5f}".format(
+                    lat_val, lon_val) if lat_val is not None and lon_val is not None else ""
+                write_csv(csv_path, rows)  # crash-safe: write after each row
+                located += 1
+                print("{:40.40}  [lens] {} -> {:.5f},{:.5f}".format(
+                    row.get("file_name", asset_id), name, lat_val, lon_val))
+                print("    geocoded as: {}".format(detail))
                 continue
 
         # No match found
         row["status"] = "not_found"
-        rows[i] = row
-        write_csv(csv_path, rows)
+        write_csv(csv_path, rows)  # crash-safe: write after each row
         not_found += 1
         print("{:40.40}  no location found".format(row.get("file_name", asset_id)))
 
@@ -569,7 +559,7 @@ def cmd_recognize(args):
 # ---------------------------------------------------------------------------
 
 def cmd_apply(args):
-    """Write approved rows back to Immich. Idempotent, --dry-run by default."""
+    """Write approved rows back to Immich. Idempotent; --dry-run prints only."""
     load_env()
     immich_url = os.environ.get("IMMICH_URL", "")
     immich_key = os.environ.get("IMMICH_API_KEY", "")
@@ -587,10 +577,10 @@ def cmd_apply(args):
         sys.exit("CSV file not found: {}".format(csv_path))
 
     rows = read_csv(csv_path)
-    dry_run = not args.apply
+    dry_run = args.dry_run
     written = errors = skipped = 0
 
-    for i, row in enumerate(rows):
+    for row in rows:
         asset_id = row.get("asset_id", "")
         status = row.get("status", "")
         lat_str = row.get("latitude", "")
@@ -626,8 +616,7 @@ def cmd_apply(args):
             try:
                 immich.set_location(asset_id, lat, lon)
                 row["status"] = "applied"
-                rows[i] = row
-                write_csv(csv_path, rows)
+                write_csv(csv_path, rows)  # crash-safe: persist after each write
                 print("WRITTEN:   {:40.40}  -> {:.5f},{:.5f}".format(
                     row.get("file_name", asset_id), lat, lon))
                 written += 1
@@ -640,7 +629,7 @@ def cmd_apply(args):
     if dry_run:
         print("dry run: {} would be written, {} errors, {} skipped".format(
             written, errors, skipped))
-        print("(use --apply to actually write to Immich)")
+        print("(re-run without --dry-run to write to Immich)")
     else:
         print("done: {} written, {} errors, {} skipped".format(
             written, errors, skipped))
@@ -677,8 +666,8 @@ def main():
     # apply subcommand
     app_parser = subparsers.add_parser("apply", help="Write coordinates to Immich")
     app_parser.add_argument("csv", help="CSV file path")
-    app_parser.add_argument("--apply", action="store_true",
-                             help="actually write to Immich (default: dry run)")
+    app_parser.add_argument("--dry-run", action="store_true",
+                            help="print what would be written without changing anything")
 
     args = parser.parse_args()
 
