@@ -33,6 +33,7 @@ Usage: python3 dispatcher/dispatch.py [--dry] [--loop]
        no notifications, no state changes.
   --loop repeats ticks until the repo is idle, blocked, or aborted.
 """
+import fcntl
 import json
 import os
 import re
@@ -49,6 +50,7 @@ REPO = Path(__file__).resolve().parent.parent
 ROADMAP = REPO / "ROADMAP.md"
 LOGDIR = REPO / "dispatcher" / "logs"
 STATE_FILE = REPO / "dispatcher" / "state.json"
+LOCK_FILE = REPO / "dispatcher" / ".lock"
 MAX_TURNS = "150"
 MAX_PRICE = os.environ.get("DISPATCH_MAX_PRICE", "10")
 SESSION_TIMEOUT_S = 5400
@@ -439,10 +441,26 @@ def tick(dry):
     return "idle"
 
 
+def acquire_lock():
+    """Non-blocking flock; returns the held handle or None if taken."""
+    LOCK_FILE.parent.mkdir(exist_ok=True)
+    fh = LOCK_FILE.open("w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
 def main():
     dry = "--dry" in sys.argv
     loop = "--loop" in sys.argv
     LOGDIR.mkdir(exist_ok=True)
+    lock = acquire_lock()
+    if lock is None:
+        log("another dispatcher tick is already running; skipping")
+        return 0
     status = None
     while True:
         status = tick(dry)
