@@ -266,8 +266,8 @@ def tick(dry):
     for issue in blockers:
         if issue["number"] not in state["seen_blockers"]:
             state["seen_blockers"].append(issue["number"])
-            log(f"new blocker issue #{issue['number']}: {issue['title']}")
-            if not dry:
+            log(f"blocker issue #{issue['number']} ({issue['state'].lower()}): {issue['title']}")
+            if not dry and issue["state"] == "OPEN":
                 notify.notify(f"{REPO_NAME}: blocked",
                               f"#{issue['number']} {issue['title']} — answer to resume",
                               priority="high", tags="warning", url=issue.get("url"))
