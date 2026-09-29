@@ -12,13 +12,18 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
        - blocker with the `answered` label (owner commented + labeled) or
          closed by the owner -> resume: launch a session with the issue
          number and the owner's answer quoted in the prompt.
-  3. If open PRs exist:
+  3. Task issues (open, label `task`) are owner-filed work orders — the
+     way to launch work from the phone. First unlaunched task -> one
+     session with the issue body and comments as the prompt. Two failed
+     task sessions -> the issue gains the `blocker` label and the repo
+     pauses.
+  4. If open PRs exist:
        - merge approved PRs with green checks first (squash, delete branch);
        - any remaining PR without the `approved` label -> run a QA session.
          Two QA passes on the same PR without approval -> blocker + pause.
-  4. Else: run an Implementation session on the first unchecked ROADMAP.md
+  5. Else: run an Implementation session on the first unchecked ROADMAP.md
      item (a role tag in the item text selects the prompt; default impl).
-  5. Else: idle (roadmap complete) -> notify once.
+  6. Else: idle (roadmap complete) -> notify once.
 
 Failure budget: dispatcher/state.json counts consecutive failed sessions
 (non-zero exit or timeout) per roadmap item. 2 strikes on the same item ->
@@ -110,6 +115,23 @@ section, tick the matching ROADMAP.md checkbox if the item completes, and
 close issue #{number} once the blocker is resolved. When done: push the
 branch, then `git checkout main` so the working tree is left clean."""
 
+TASK_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
+The owner has filed issue #{number}: "{title}"
+
+Issue body:
+{body}
+{comments}
+Investigate and resolve it: inspect the code and docs, reproduce or verify
+the problem, and fix it. If a fix is not warranted, comment your findings
+on issue #{number} and close it instead. Follow the hard constraints and
+decision defaults in AGENTS.md. Work on a new branch, commit incrementally,
+open a draft PR with a Handoff section referencing issue #{number}, then
+close issue #{number} with a short comment linking the PR. If you are
+blocked (question only the owner can answer), comment on issue #{number},
+add the `blocker` label (`gh issue edit {number} --add-label blocker`),
+and stop cleanly. When done: push the branch, then `git checkout main` so
+the working tree is left clean."""
+
 PROMPTS = {"impl": IMPL_PROMPT, "qa": QA_PROMPT}
 
 STASH_NOTE = ("\n\nNote: a previous session on this repo was interrupted. Its "
@@ -170,7 +192,7 @@ def maybe_save(state, dry):
 
 def ensure_labels():
     for name, color in (("approved", "0E8A16"), ("blocker", "D93F0B"),
-                        ("answered", "FBCA04")):
+                        ("answered", "FBCA04"), ("task", "1D76DB")):
         run(["gh", "label", "create", name, "--color", color])
 
 
@@ -360,7 +382,8 @@ def tick(dry):
     for key, default in (("failures", {}), ("qa_strikes", {}),
                          ("seen_blockers", []), ("resumed_blockers", []),
                          ("seen_prs", []), ("approved_prs", []),
-                         ("merge_failed_prs", []), ("notified_done", False)):
+                         ("launched_tasks", []), ("merge_failed_prs", []),
+                         ("notified_done", False)):
         state.setdefault(key, default)
 
     if not dry:
@@ -414,6 +437,60 @@ def tick(dry):
         if code == 0:
             state.pop("stash_note_pending", None)
             maybe_save(state, dry)
+        return "worked"
+
+    # --- task issues: owner-filed work orders (launch from the phone) ---
+    tasks = gh_json(["gh", "issue", "list", "--label", "task",
+                     "--state", "open", "--json", "number,title,url"])
+    if tasks is None:
+        return "abort"
+    for issue in tasks:
+        if issue["number"] in state["launched_tasks"]:
+            continue
+        n = issue["number"]
+        if dry:
+            log(f"would run task session for issue #{n}: {issue['title']}")
+            return "worked"
+        data = gh_json(["gh", "issue", "view", str(n),
+                        "--json", "body,comments"]) or {}
+        body = (data.get("body") or "").strip() or "(no body)"
+        comments = data.get("comments") or []
+        ctext = ""
+        if comments:
+            ctext = "\nIssue comments:\n" + "\n".join(
+                f"- {c.get('author', {}).get('login', '?')}: "
+                f"{(c.get('body') or '').strip()}" for c in comments)
+        state["launched_tasks"].append(n)
+        maybe_save(state, dry)
+        log(f"task issue #{n}: {issue['title']}")
+        notify.notify(f"{REPO_NAME}: task launched",
+                      f"#{n} {issue['title']}", tags="rocket", url=issue.get("url"))
+        note = STASH_NOTE if state.get("stash_note_pending") else ""
+        code = run_session("impl", TASK_PROMPT.format(
+            number=n, title=issue["title"], body=body, comments=ctext) + note)
+        if code is None:
+            return "abort"
+        key = f"task #{n}"
+        if code == 0:
+            state["failures"].pop(key, None)
+            state.pop("stash_note_pending", None)
+        else:
+            fails = state["failures"].get(key, 0) + 1
+            state["failures"][key] = fails
+            log(f"task session failed (exit {code}); failures: {fails}")
+            if fails >= FAIL_STRIKES:
+                run(["gh", "issue", "comment", str(n), "--body",
+                     "The dispatcher could not complete this task in two "
+                     "sessions (see dispatcher/logs/). Pausing this repo; "
+                     "comment here and add the `answered` label to resume."])
+                run(["gh", "issue", "edit", str(n), "--add-label", "blocker"])
+                state["seen_blockers"].append(n)
+                notify.notify(f"{REPO_NAME}: paused",
+                              f"task #{n} failed twice — needs a look",
+                              priority="high", tags="warning", url=issue.get("url"))
+                maybe_save(state, dry)
+                return "blocked"
+        maybe_save(state, dry)
         return "worked"
 
     # --- pull requests ---

@@ -49,6 +49,11 @@ whole run. When a question is not answered by PLAN.md:
 - **No live API calls.** The sandbox has no credentials and no network
   path to the owner's Immich server. All tests use fake payloads and
   mocked HTTP. Never fabricate "live validation" results.
+- **Never pip install into the system Python.** Sessions may run inside
+  the agent-runner container, whose Python is shared with the `vibe`
+  CLI itself — installing or upgrading packages there breaks the agent
+  loop. If you need dependencies, use a venv:
+  `python3 -m venv /tmp/venv && /tmp/venv/bin/pip install ...`.
 - **Never commit personal data**: `.env`, CSVs (`*.csv` may contain real
   filenames and locations), and `testdata/` (the owner copies real photos
   there for local testing) are gitignored — keep them out.
