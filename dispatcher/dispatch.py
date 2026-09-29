@@ -5,7 +5,8 @@ One invocation = one tick; with --loop the dispatcher re-evaluates after
 each session and keeps going back-to-back until the repo is idle, blocked,
 or aborted. run.sh prevents overlapping invocations. State machine per tick:
 
-  1. Abort if the working tree is dirty. Checkout main, pull --ff-only.
+  1. If the working tree is dirty (interrupted session), stash -u, notify,
+     and continue. Checkout main, pull --ff-only.
   2. Blocker issues (label `blocker`) are the human-in-the-loop channel:
        - new blocker -> notify the owner once (push); repo pauses;
        - blocker with the `answered` label (owner commented + labeled) or
@@ -220,6 +221,8 @@ def run_session(role, prompt):
              "--output", "json"],
             cwd=REPO, capture_output=True, text=True, timeout=SESSION_TIMEOUT_S)
         logfile.write_text(r.stdout or "")
+        if r.returncode != 0 and (r.stderr or "").strip():
+            (LOGDIR / f"{ts}-{role}.err").write_text(r.stderr)
         (LOGDIR / f"{ts}-{role}.exit").write_text(str(r.returncode) + "\n")
         log(f"{role} session finished, exit {r.returncode}")
         return r.returncode
@@ -241,8 +244,18 @@ def tick(dry):
     """
     status = run(["git", "status", "--porcelain"])
     if status.stdout.strip():
-        log("ABORT: working tree not clean")
-        return "abort"
+        if dry:
+            log("ABORT: working tree not clean")
+            return "abort"
+        log("working tree not clean (interrupted session?); stashing, back to main")
+        stashed = run(["git", "stash", "-u"])
+        if stashed.returncode != 0:
+            log(f"ABORT: could not stash dirty tree: {stashed.stderr.strip()[:200]}")
+            return "abort"
+        notify.notify(f"{REPO_NAME}: recovered dirty working tree",
+                      "Stashed uncommitted changes left by an interrupted "
+                      "session; see `git stash list` in the clone.",
+                      tags="warning")
     run(["git", "checkout", "main"])
     pull = run(["git", "pull", "--ff-only"])
     if pull.returncode != 0:
