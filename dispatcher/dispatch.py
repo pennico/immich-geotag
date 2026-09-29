@@ -12,9 +12,9 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
          closed by the owner -> resume: launch a session with the issue
          number and the owner's answer quoted in the prompt.
   3. If open PRs exist:
-       - any PR without the `approved` label -> run a QA session. Two QA
-         passes on the same PR without approval -> blocker issue + pause.
-       - all approved -> merge those with green checks (squash, delete branch).
+       - merge approved PRs with green checks first (squash, delete branch);
+       - any remaining PR without the `approved` label -> run a QA session.
+         Two QA passes on the same PR without approval -> blocker + pause.
   4. Else: run an Implementation session on the first unchecked ROADMAP.md
      item (a role tag in the item text selects the prompt; default impl).
   5. Else: idle (roadmap complete) -> notify once.
@@ -318,6 +318,40 @@ def tick(dry):
                               f"#{p['number']} {p['title']}",
                               tags="envelope", url=p.get("url"))
     if prs:
+        # Merge approved + green PRs first (cheap gh calls, no session),
+        # so ready work is not held up by PRs still under review.
+        waiting = False
+        for p in prs:
+            if "approved" not in {l["name"] for l in p["labels"]}:
+                continue
+            if p["number"] not in state["approved_prs"]:
+                state["approved_prs"].append(p["number"])
+                log(f"PR #{p['number']} approved")
+                if not dry:
+                    notify.notify(f"{REPO_NAME}: PR approved",
+                                  f"#{p['number']} {p['title']} — will merge",
+                                  tags="ok", url=p.get("url"))
+            if not checks_pass(p["number"]):
+                log(f"PR #{p['number']} approved but checks not green; waiting")
+                waiting = True
+                continue
+            log(f"PR #{p['number']} approved + green: merge")
+            if dry:
+                continue
+            if merge(p["number"], p["title"], p.get("isDraft", False)):
+                state["qa_strikes"].pop(str(p["number"]), None)
+                state["approved_prs"] = [n for n in state["approved_prs"]
+                                         if n != p["number"]]
+                notify.notify(f"{REPO_NAME}: PR merged",
+                              f"#{p['number']} {p['title']}",
+                              tags="white_check_mark", url=p.get("url"))
+            else:
+                waiting = True
+                if p["number"] not in state["merge_failed_prs"]:
+                    state["merge_failed_prs"].append(p["number"])
+                    notify.notify(f"{REPO_NAME}: merge failed",
+                                  f"#{p['number']} {p['title']} — merge error, needs a look",
+                                  priority="high", tags="warning", url=p.get("url"))
         unapproved = [p for p in prs
                       if "approved" not in {l["name"] for l in p["labels"]}]
         if unapproved:
@@ -348,36 +382,6 @@ def tick(dry):
             if not dry:
                 run_session("qa", QA_PROMPT)
             return "worked"
-        waiting = False
-        for p in prs:
-            if p["number"] not in state["approved_prs"]:
-                state["approved_prs"].append(p["number"])
-                log(f"PR #{p['number']} approved")
-                if not dry:
-                    notify.notify(f"{REPO_NAME}: PR approved",
-                                  f"#{p['number']} {p['title']} — will merge",
-                                  tags="ok", url=p.get("url"))
-            if not checks_pass(p["number"]):
-                log(f"PR #{p['number']} approved but checks not green; waiting")
-                waiting = True
-                continue
-            log(f"PR #{p['number']} approved + green: merge")
-            if dry:
-                continue
-            if merge(p["number"], p["title"], p.get("isDraft", False)):
-                state["qa_strikes"].pop(str(p["number"]), None)
-                state["approved_prs"] = [n for n in state["approved_prs"]
-                                         if n != p["number"]]
-                notify.notify(f"{REPO_NAME}: PR merged",
-                              f"#{p['number']} {p['title']}",
-                              tags="white_check_mark", url=p.get("url"))
-            else:
-                waiting = True
-                if p["number"] not in state["merge_failed_prs"]:
-                    state["merge_failed_prs"].append(p["number"])
-                    notify.notify(f"{REPO_NAME}: merge failed",
-                                  f"#{p['number']} {p['title']} — merge error, needs a look",
-                                  priority="high", tags="warning", url=p.get("url"))
         maybe_save(state, dry)
         return "waiting" if waiting else "worked"
 
