@@ -259,32 +259,39 @@ def recover_dirty_tree():
 
     Stashes uncommitted changes and notes unpushed local branches; the
     pending flag in state.json makes the next implementation session's
-    prompt point at both. Returns True if anything was found.
+    prompt point at both. Each branch triggers exactly one notification
+    (idle repos re-tick every few minutes; leftovers must not spam).
+    Returns True if interrupted work exists.
     """
-    found = False
+    stashed = False
     status = run(["git", "status", "--porcelain"])
     if status.stdout.strip():
-        stashed = run(["git", "stash", "-u"])
-        if stashed.returncode != 0:
-            log(f"could not stash dirty tree: {stashed.stderr.strip()[:200]}")
+        r = run(["git", "stash", "-u"])
+        if r.returncode != 0:
+            log(f"could not stash dirty tree: {r.stderr.strip()[:200]}")
         else:
             log("stashed uncommitted changes from an interrupted session")
-            found = True
+            stashed = True
     branches = interrupted_branches()
-    if branches:
-        log(f"unpushed branches from an interrupted session: {branches}")
-        found = True
-    if not found:
-        return False
     state = load_state()
-    state["stash_note_pending"] = True
-    save_state(state)
-    notify.notify(f"{REPO_NAME}: recovered work from an interrupted session",
-                  "Stashed uncommitted changes and/or found unpushed "
-                  "branches; see `git stash list` and `git branch` in the "
-                  "clone.",
-                  tags="warning")
-    return True
+    known = state.setdefault("notified_branches", [])
+    new_branches = [b for b in branches if b not in known]
+    if new_branches:
+        log(f"unpushed branches from an interrupted session: {new_branches}")
+    if stashed or new_branches:
+        state["stash_note_pending"] = True
+        state["notified_branches"] = known + new_branches
+        save_state(state)
+        notify.notify(f"{REPO_NAME}: recovered work from an interrupted session",
+                      "Stashed uncommitted changes and/or found unpushed "
+                      "branches; see `git stash list` and `git branch` in "
+                      "the clone.",
+                      tags="warning")
+    elif branches:
+        # known leftovers: keep the note flag fresh, stay quiet
+        state["stash_note_pending"] = True
+        save_state(state)
+    return stashed or bool(branches)
 
 
 def run_session(role, prompt):
