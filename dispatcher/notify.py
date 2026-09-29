@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Best-effort push notifications via ntfy (outbound HTTPS only).
 
-Set NTFY_TOPIC in the environment (optionally NTFY_SERVER to self-host).
-Without a topic, notify() is a silent no-op. Failures are logged to stderr
-and never raised: notifications are best-effort, GitHub issues are the
-durable record.
+Set NTFY_TOPIC in the environment (optionally NTFY_SERVER to self-host,
+NTFY_TOKEN if the instance requires auth). Without a topic, notify() is a
+silent no-op. Failures are logged to stderr and never raised: notifications
+are best-effort, GitHub issues are the durable record.
 """
 import os
 import sys
@@ -12,6 +12,7 @@ import urllib.request
 
 SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 TOPIC = os.environ.get("NTFY_TOPIC", "")
+TOKEN = os.environ.get("NTFY_TOKEN", "")
 PRIORITIES = {"min": "1", "default": "3", "high": "4"}
 
 
@@ -23,6 +24,8 @@ def notify(title, body, priority="default", tags="", url=""):
         "X-Title": title,
         "X-Priority": PRIORITIES.get(priority, PRIORITIES["default"]),
     }
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
     if tags:
         headers["X-Tags"] = tags
     if url:
