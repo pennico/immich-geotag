@@ -8,3 +8,8 @@ an [impl] session.
 - [x] [impl] Chunk 2: recognize + apply full behavior — crash-safe rewrite, idempotency, --dry-run (steps 4-5)
 - [x] [impl] Chunk 3: --thumbs DIR local-read mode (step 6)
 - [x] [impl] Chunk 4: committed fake-payload test suite (step 7)
+
+Built outside the dispatcher chunks (owner session, 2026-09-29):
+`monthly_geotag.py` — self-running monthly backfill within the Vision
+free tier (usage ledger, never-retry state, ntfy summary). See README.md
+and pennico-ops `homelab/README.md` for the deployment.
