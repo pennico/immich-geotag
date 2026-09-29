@@ -6,3 +6,4 @@ dispatcher/.lock
 __pycache__/
 *.pyc
 .DS_Store
+dispatcher/state.json

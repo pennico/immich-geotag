@@ -1,54 +1,69 @@
 # Unattended agent dispatcher
 
-Runs the multi-agent workflow headless on an always-on server (homelab) so
-the project progresses without anyone launching sessions manually.
-
-## One-time setup (on the homelab)
-
-1. Install the CLI and authenticate:
-   ```bash
-   uv tool install mistral-vibe
-   # put your key in ~/.vibe/.env :  MISTRAL_API_KEY=...
-   ```
-2. Clone this repo with push rights:
-   ```bash
-   gh auth login          # or use a deploy key
-   git clone https://github.com/pennico/immich-geotag.git ~/projects/immich-geotag
-   ```
-3. Smoke-test the state machine without launching anything:
-   ```bash
-   cd ~/projects/immich-geotag && python3 dispatcher/dispatch.py --dry
-   ```
-4. Schedule it (every 3 hours; overlapping runs are skipped by flock):
-   ```bash
-   crontab -e
-   # add:
-   0 1-23/3 * * * ~/projects/immich-geotag/dispatcher/run.sh >> ~/projects/immich-geotag/dispatcher/logs/cron.log 2>&1
-   ```
-   (offset from the tts-ereader cron so the two projects don't run sessions
-   at the same time)
+Runs the multi-agent workflow headless on an always-on runner (homelab
+container — see `pennico-ops/homelab/`) so the project progresses without
+anyone launching sessions manually.
 
 ## What a tick does
 
 1. Abort if the working tree is dirty; checkout main; pull --ff-only.
-2. Open PRs? -> any without the `approved` label triggers a QA session;
-   all approved + green checks -> squash-merge.
-3. No PRs -> Implementation session on the first unchecked ROADMAP.md item.
-4. Roadmap complete -> idle.
+2. Blocker issues (label `blocker`): a new one notifies the owner once and
+   pauses the repo; one with the `answered` label (owner commented +
+   labeled) or closed by the owner resumes the loop with the answer quoted
+   in the session prompt.
+3. Open PRs? -> any without the `approved` label triggers a QA session
+   (two QA passes without approval -> blocker issue + pause); all approved
+   + green checks -> squash-merge.
+4. No PRs -> Implementation session on the first unchecked ROADMAP.md item
+   (every chunk is an [impl] session).
+5. Roadmap complete -> idle + one "roadmap done" notification.
+
+## Modes
+
+- `python3 dispatcher/dispatch.py --dry` — print decisions, do nothing.
+- `python3 dispatcher/dispatch.py` — one tick (one session at most).
+- `dispatcher/run.sh --loop` — back-to-back: after each session, re-evaluate
+  and launch the next immediately. Stops only when the roadmap is
+  complete, the repo is blocked, or the failure budget trips. This is what
+  the homelab supervisor runs.
+
+## Failure budget
+
+`dispatcher/state.json` (gitignored) tracks consecutive failed sessions
+(non-zero exit or timeout) per roadmap item. 2 strikes on the same item ->
+the dispatcher files a blocker issue and pauses the repo; the owner's
+answer on that issue resumes with a fresh budget. QA has the same budget:
+2 QA passes on the same PR without approval -> blocker issue + pause.
+
+## Notifications
+
+`dispatcher/notify.py` sends push notifications via ntfy (outbound HTTPS
+only — nothing is exposed inbound). Set `NTFY_TOPIC` in the runner's
+environment (optionally `NTFY_SERVER` to self-host). Without a topic,
+notifications are a silent no-op. Events: blocker filed (high), failure
+budget hit (high), roadmap done (high), PR opened/approved/merged
+(default). Failures to send are logged, never fatal — GitHub issues are
+the durable record.
+
+## Cost cap
+
+Sessions run with `--max-price $DISPATCH_MAX_PRICE` (default 10) plus
+`--max-turns 150` and a 90-minute timeout. The cap is a runaway guard, not
+a budget target; after the first supervised runs, calibrate it to roughly
+2x the observed cost of a normal session (token usage is in the session
+JSON logs).
 
 ## Guardrails
 
 - `.vibe/hooks.toml` + `.vibe/guard.py` deny destructive bash commands
   (force-push, reset --hard, rm -rf, sudo, pipe-to-shell) and any agent
   access to `.env`. Loaded because the dispatcher passes `--trust`.
-- Sessions run with `--auto-approve --max-turns 150` and a 90-minute
-  timeout; output is captured, never interactive.
+- Sessions run with `--auto-approve --max-turns 150 --max-price ...` and a
+  90-minute timeout; output is captured, never interactive.
 - The dispatcher never force-pushes, never merges unapproved PRs, and
   aborts on a dirty tree.
-- Extra safety for this project: agents are instructed never to write to
-  the Immich server; live validation is the owner's job (see AGENTS.md).
 
 ## Logs
 
 `dispatcher/logs/` (gitignored): one JSON file per session, an `.exit`
-file with its return code, and `cron.log`.
+file with its return code, and the runner's cron/supervisor log.
