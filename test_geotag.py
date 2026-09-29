@@ -34,6 +34,7 @@ from geotag import (
     lens_locate,
     load_env,
     nominatim_search,
+    multipart_post,
     read_csv,
     read_local_thumb,
     vision_landmark,
@@ -262,21 +263,103 @@ class TestHelpers(unittest.TestCase):
     def test_clean_match_title_extra_spaces(self):
         self.assertEqual(clean_match_title("  Eiffel Tower - Wikipedia  "), "Eiffel Tower")
 
-    def test_load_env_basic(self):
-        tmpdir = tempfile.mkdtemp()
-        env_path = os.path.join(tmpdir, ".env")
-        with open(env_path, "w") as f:
-            f.write("KEY1=value1\n")
-            f.write("KEY2=value2\n")
-        old_path = os.environ.get("PATH", "")
-        try:
-            os.environ["PATH"] = tmpdir
-            load_env()
-            # Note: load_env only sets if not already in os.environ
-            # So we check the file can be read
-        finally:
-            os.environ["PATH"] = old_path
-        shutil.rmtree(tmpdir, ignore_errors=True)
+
+class TestLoadEnv(unittest.TestCase):
+    """load_env reads SCRIPT_DIR/.env; real environment variables win."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_env(self, text):
+        with open(os.path.join(self.tmpdir, ".env"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_load_env_sets_keys_from_file(self):
+        self._write_env("GEOTAG_TEST_A=one\nGEOTAG_TEST_B=two\n")
+        with mock.patch("geotag.SCRIPT_DIR", self.tmpdir):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                load_env()
+                self.assertEqual(os.environ["GEOTAG_TEST_A"], "one")
+                self.assertEqual(os.environ["GEOTAG_TEST_B"], "two")
+
+    def test_load_env_real_env_wins(self):
+        self._write_env("GEOTAG_TEST_A=from-file\n")
+        with mock.patch("geotag.SCRIPT_DIR", self.tmpdir):
+            with mock.patch.dict(os.environ, {"GEOTAG_TEST_A": "from-env"},
+                                 clear=False):
+                load_env()
+                self.assertEqual(os.environ["GEOTAG_TEST_A"], "from-env")
+
+    def test_load_env_skips_comments_blanks_strips_quotes(self):
+        self._write_env(
+            "# a comment\n"
+            "\n"
+            "GEOTAG_TEST_A='quoted'\n"
+            "GEOTAG_TEST_B=\"double\"\n"
+            "not-an-assignment\n"
+            "GEOTAG_TEST_C=plain\n"
+        )
+        with mock.patch("geotag.SCRIPT_DIR", self.tmpdir):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                load_env()
+                self.assertEqual(os.environ["GEOTAG_TEST_A"], "quoted")
+                self.assertEqual(os.environ["GEOTAG_TEST_B"], "double")
+                self.assertEqual(os.environ["GEOTAG_TEST_C"], "plain")
+
+    def test_load_env_missing_file_is_noop(self):
+        # No .env in SCRIPT_DIR: load_env must not raise.
+        with mock.patch("geotag.SCRIPT_DIR", self.tmpdir):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                load_env()
+
+
+class TestMultipartPost(unittest.TestCase):
+    """multipart_post builds a valid multipart body (SerpApi upload)."""
+
+    @mock.patch("geotag.http_request")
+    def test_multipart_body_structure(self, mock_request):
+        mock_request.return_value = (200, b'{"image_id": "abc"}')
+
+        result = multipart_post(
+            "https://serpapi.com/image", "image", "preview.jpg",
+            b"jpeg-bytes", {"api_key": "k1"})
+
+        self.assertEqual(result, {"image_id": "abc"})
+        self.assertEqual(mock_request.call_count, 1)
+        self.assertEqual(mock_request.call_args[0][0], "POST")
+        self.assertEqual(mock_request.call_args[0][1], "https://serpapi.com/image")
+
+        headers = mock_request.call_args[1]["headers"]
+        body = mock_request.call_args[1]["body"]
+
+        # Boundary is consistent between the header and the body
+        self.assertIn("multipart/form-data; boundary=", headers["Content-Type"])
+        boundary = headers["Content-Type"].split("boundary=")[1]
+        self.assertIn(boundary.encode("utf-8"), body)
+
+        # Extra fields are sent as form parts
+        self.assertIn(b'name="api_key"', body)
+        self.assertIn(b"\r\n\r\nk1\r\n", body)
+
+        # File part: field name, filename, content type, then the bytes
+        self.assertIn(b'name="image"; filename="preview.jpg"', body)
+        self.assertIn(b"Content-Type: application/octet-stream", body)
+        self.assertIn(b"jpeg-bytes", body)
+
+        # Terminating boundary
+        self.assertTrue(body.endswith(
+            "--{}--\r\n".format(boundary).encode("utf-8")))
+
+    @mock.patch("geotag.http_request")
+    def test_multipart_post_http_error_raises(self, mock_request):
+        mock_request.return_value = (500, b"server error")
+        with self.assertRaises(ApiError):
+            multipart_post(
+                "https://serpapi.com/image", "image", "preview.jpg",
+                b"jpeg-bytes", {"api_key": "k1"})
 
 
 # ---------------------------------------------------------------------------
