@@ -147,7 +147,11 @@ def open_prs():
 
 
 def checks_pass(number):
-    return run(["gh", "pr", "checks", str(number)]).returncode == 0
+    r = run(["gh", "pr", "checks", str(number)])
+    if r.returncode == 0:
+        return True
+    # Repos without CI: "no checks reported" counts as green.
+    return "no checks reported" in (r.stderr or "")
 
 
 def merge(number, title):
