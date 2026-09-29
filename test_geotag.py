@@ -35,6 +35,7 @@ from geotag import (
     load_env,
     nominatim_search,
     read_csv,
+    read_local_thumb,
     vision_landmark,
     write_csv,
 )
@@ -389,6 +390,89 @@ class TestImmichClient(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    @mock.patch("geotag.http_bytes")
+    def test_preview_jpeg_thumbs_dir_missing_falls_back_to_http(self, mock_http_bytes):
+        """A missing local thumb falls back to the API preview download."""
+        mock_http_bytes.return_value = FAKE_PREVIEW_JPEG
+        tmpdir = tempfile.mkdtemp()
+        try:
+            immich = Immich("https://immich.example.com", "test-api-key")
+            result = immich.preview_jpeg(
+                "test-asset-001", thumbs_dir=os.path.join(tmpdir, "thumbs"))
+            self.assertEqual(result, FAKE_PREVIEW_JPEG)
+            mock_http_bytes.assert_called_once()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Test --thumbs DIR local-read mode (layouts verified against Immich source)
+# ---------------------------------------------------------------------------
+
+class TestReadLocalThumb(unittest.TestCase):
+    """read_local_thumb finds the preview file across Immich versions.
+
+    Layouts verified against server/src/cores/storage.core.ts at tags
+    v2.0.0 and v3.2.4 (see PLAN.md build step 6):
+      v3.x:  thumbs/<ownerId>/<id[0:2]>/<id[2:4]>/<id>_preview.<jpeg|webp>
+      v2.x:  thumbs/<ownerId>/<id[0:2]>/<id[2:4]>/<id>-preview.<jpeg|webp>
+      v1.x:  thumbs/<id[0:2]>/<id[2:4]>/<id>-preview.<jpeg|webp>
+    """
+
+    ASSET_ID = "test-asset-001"  # shard dirs: "te" / "st"
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.thumbs_dir = os.path.join(self.tmpdir, "thumbs")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_thumb(self, relpath, content=FAKE_PREVIEW_JPEG):
+        path = os.path.join(self.thumbs_dir, relpath)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    def test_v3_layout_with_owner_folder(self):
+        self._write_thumb(os.path.join("owner-1", "te", "st",
+                                      self.ASSET_ID + "_preview.jpeg"))
+        data = read_local_thumb(self.thumbs_dir, self.ASSET_ID)
+        self.assertEqual(data, FAKE_PREVIEW_JPEG)
+
+    def test_v3_layout_webp(self):
+        self._write_thumb(os.path.join("owner-1", "te", "st",
+                                      self.ASSET_ID + "_preview.webp"))
+        data = read_local_thumb(self.thumbs_dir, self.ASSET_ID)
+        self.assertEqual(data, FAKE_PREVIEW_JPEG)
+
+    def test_v2_layout_with_owner_folder(self):
+        self._write_thumb(os.path.join("owner-1", "te", "st",
+                                      self.ASSET_ID + "-preview.jpeg"))
+        data = read_local_thumb(self.thumbs_dir, self.ASSET_ID)
+        self.assertEqual(data, FAKE_PREVIEW_JPEG)
+
+    def test_v1_classic_layout(self):
+        self._write_thumb(os.path.join("te", "st",
+                                      self.ASSET_ID + "-preview.jpeg"))
+        data = read_local_thumb(self.thumbs_dir, self.ASSET_ID)
+        self.assertEqual(data, FAKE_PREVIEW_JPEG)
+
+    def test_legacy_layout(self):
+        # Layout from the original implementation (PLAN.md's rough note),
+        # kept as a candidate for compatibility.
+        self._write_thumb(os.path.join("te", "st", self.ASSET_ID + ".jpeg"))
+        data = read_local_thumb(self.thumbs_dir, self.ASSET_ID)
+        self.assertEqual(data, FAKE_PREVIEW_JPEG)
+
+    def test_missing_thumb_returns_none(self):
+        self.assertIsNone(read_local_thumb(self.thumbs_dir, self.ASSET_ID))
+
+    def test_empty_args_return_none(self):
+        self.assertIsNone(read_local_thumb(None, self.ASSET_ID))
+        self.assertIsNone(read_local_thumb(self.thumbs_dir, ""))
+
 
 # ---------------------------------------------------------------------------
 # Test recognition backends (with mocked HTTP)
@@ -672,6 +756,52 @@ class TestRecognizeWorkflow(unittest.TestCase):
         self.assertEqual(rows_after[0]["source"], "vision")
         self.assertEqual(rows_after[0]["score"], "0.95")
         self.assertIn("48.85837,2.29448", rows_after[0]["maps_url"])
+
+    def test_recognize_thumbs_without_immich_config(self):
+        """With no Immich API config, --thumbs is the only image source."""
+        asset_id = "test-asset-001"
+        csv_path = os.path.join(self.tmpdir, "test.csv")
+        rows = [
+            {"asset_id": asset_id, "file_name": "f1.jpg", "latitude": "",
+             "longitude": "", "place": "", "source": "",
+             "score": "", "status": "pending", "maps_url": ""},
+        ]
+        write_csv(csv_path, rows)
+
+        # Local thumb in the v3.x layout: thumbs/<owner>/<te>/<st>/<id>_preview.jpeg
+        thumbs_dir = os.path.join(self.tmpdir, "thumbs")
+        thumb_path = os.path.join(thumbs_dir, "owner-1", "te", "st",
+                                  asset_id + "_preview.jpeg")
+        os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
+        with open(thumb_path, "wb") as f:
+            f.write(FAKE_PREVIEW_JPEG)
+
+        from geotag import cmd_recognize
+        import argparse
+        args = argparse.Namespace(
+            csv=csv_path,
+            min_score=0.5,
+            max_lens_matches=3,
+            thumbs=thumbs_dir,
+        )
+
+        with mock.patch.dict(os.environ, {
+            "GOOGLE_VISION_API_KEY": "test-vision-key",
+            "IMMICH_URL": "",
+            "IMMICH_API_KEY": "",
+        }):
+            with mock.patch("geotag.load_env"):
+                with mock.patch("geotag.vision_landmark") as mock_vision:
+                    mock_vision.return_value = (
+                        "Eiffel Tower", 0.95, 48.85837, 2.294481)
+                    cmd_recognize(args)
+
+        # Vision must have received the bytes read from the local thumb file
+        mock_vision.assert_called_once_with(
+            FAKE_PREVIEW_JPEG, "test-vision-key", 0.5)
+        rows_after = read_csv(csv_path)
+        self.assertEqual(rows_after[0]["status"], "located")
+        self.assertEqual(rows_after[0]["latitude"], "48.85837")
 
     def test_recognize_not_found(self):
         """No Vision match and no SerpApi key -> status=not_found."""

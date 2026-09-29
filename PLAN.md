@@ -124,9 +124,13 @@ Real environment variables override `.env`.
 - **On the server itself:** add `--thumbs DIR` so `recognize` reads the
   already-generated preview files straight from Immich's thumbnail directory
   instead of downloading them. Zero HTTP for image transfer.
-  Thumb path layout must be verified against the installed Immich version
-  before implementing (sharded layout, roughly
-  `thumbs/<id[0:2]>/<id[2:4]>/<assetId>.jpeg`).
+  Thumb path layout verified against the Immich server source
+  (`server/src/cores/storage.core.ts`, tags v2.0.0 and v3.2.4):
+  - v3.x: `thumbs/<ownerId>/<id[0:2]>/<id[2:4]>/<id>_preview.<jpeg|webp>`
+  - v2.x: `thumbs/<ownerId>/<id[0:2]>/<id[2:4]>/<id>-preview.<jpeg|webp>`
+  - v1.x: `thumbs/<id[0:2]>/<id[2:4]>/<id>-preview.<jpeg|webp>`
+  The owner folder is matched with a glob (the CSV carries no ownerId) and
+  both extensions are tried (the preview format is configurable).
 
 ## 4. Verified API reference (research done 2026-09-19)
 
@@ -198,7 +202,12 @@ External APIs:
 6. **`--thumbs DIR` mode (only if running on the server):** verify the
    thumbnail path layout against the installed Immich version first, then
    add a local-read branch in the preview fetch.
-   **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90`
+   **DONE** - initial version in `vibe/subcommands-csv-tests-6b8f90`; Chunk 3
+   (`vibe/thumbs-local-read-chunk3`) verified the layout against the Immich
+   server source (v2.0.0, v3.2.4) and fixed the candidate paths (see section 3
+   for the layouts). One shared `read_local_thumb()` helper now serves both
+   `preview_jpeg()` and the no-API branch of `recognize`; a missing local
+   thumb still falls back to the API download.
 7. **Tests:** extend the fake-payload smoke tests to the CSV layer
    (round-trip, resume-skip, apply idempotency, duplicate asset_id guard).
    **DONE** - committed in `vibe/subcommands-csv-tests-6b8f90` (45 tests)
