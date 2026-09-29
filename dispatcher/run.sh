@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# One dispatcher tick. flock -n skips the run if the previous one is still going.
+# One dispatcher tick. Overlap protection (non-blocking flock) is inside
+# the Python entry point, so this works on macOS and Linux alike.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p dispatcher/logs
-exec flock -n "dispatcher/.lock" python3 dispatcher/dispatch.py "$@"
+exec python3 dispatcher/dispatch.py "$@"
