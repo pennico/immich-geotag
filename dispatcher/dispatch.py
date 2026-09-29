@@ -29,6 +29,12 @@ Sessions run: vibe -p <prompt> --auto-approve --trust --max-turns 150
 --max-price $DISPATCH_MAX_PRICE (default 10) --output json, 90-minute
 timeout, output captured to dispatcher/logs/.
 
+Gentle shutdown: on SIGTERM (container stop, reboot) the running session
+is terminated, its uncommitted work is stashed, and the loop exits 0.
+The stash is flagged in state.json so the next session's prompt points
+the agent at it — an interrupted item resumes from the stashed work
+instead of starting from scratch.
+
 Usage: python3 dispatcher/dispatch.py [--dry] [--loop]
   --dry prints decisions and exits: no sessions, no issues, no labels,
        no notifications, no state changes.
@@ -38,6 +44,7 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -104,6 +111,25 @@ close issue #{number} once the blocker is resolved. When done: push the
 branch, then `git checkout main` so the working tree is left clean."""
 
 PROMPTS = {"impl": IMPL_PROMPT, "qa": QA_PROMPT}
+
+STASH_NOTE = ("\n\nNote: a previous session on this repo was interrupted and "
+              "its uncommitted work was stashed (`git stash list`, most "
+              "recent entry). Inspect it and reuse anything useful before "
+              "redoing work from scratch.")
+
+# --- gentle shutdown (SIGTERM) machinery ---
+_session_proc = None
+_shutdown = {"requested": False}
+
+
+class Shutdown(Exception):
+    """Raised when SIGTERM arrived; main() stashes and exits cleanly."""
+
+
+def _request_shutdown(signum, frame):
+    _shutdown["requested"] = True
+    if _session_proc is not None:
+        _session_proc.terminate()
 
 
 def log(msg):
@@ -208,31 +234,71 @@ def first_roadmap_item():
     return None, None
 
 
+def recover_dirty_tree():
+    """Stash a dirty tree left by an interrupted session (crash or SIGTERM).
+
+    Returns True if a stash was created. The pending flag in state.json
+    makes the next implementation session aware it can reuse that work.
+    """
+    status = run(["git", "status", "--porcelain"])
+    if not status.stdout.strip():
+        return False
+    stashed = run(["git", "stash", "-u"])
+    if stashed.returncode != 0:
+        log(f"could not stash dirty tree: {stashed.stderr.strip()[:200]}")
+        return False
+    state = load_state()
+    state["stash_note_pending"] = True
+    save_state(state)
+    log("stashed uncommitted changes from an interrupted session")
+    notify.notify(f"{REPO_NAME}: recovered dirty working tree",
+                  "Stashed uncommitted changes left by an interrupted "
+                  "session; see `git stash list` in the clone.",
+                  tags="warning")
+    return True
+
+
 def run_session(role, prompt):
-    """Returns the session exit code, 124 on timeout, None if vibe is missing."""
+    """Returns the session exit code, 124 on timeout, None if vibe is missing.
+
+    Raises Shutdown if SIGTERM arrived (before or during the session).
+    """
+    global _session_proc
+    if _shutdown["requested"]:
+        raise Shutdown()
     LOGDIR.mkdir(exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     logfile = LOGDIR / f"{ts}-{role}.json"
     log(f"starting {role} session (log: {logfile.name})")
+    cmd = ["vibe", "-p", prompt, "--auto-approve", "--trust",
+           "--max-turns", MAX_TURNS, "--max-price", MAX_PRICE,
+           "--output", "json"]
     try:
-        r = subprocess.run(
-            ["vibe", "-p", prompt, "--auto-approve", "--trust",
-             "--max-turns", MAX_TURNS, "--max-price", MAX_PRICE,
-             "--output", "json"],
-            cwd=REPO, capture_output=True, text=True, timeout=SESSION_TIMEOUT_S)
-        logfile.write_text(r.stdout or "")
-        if r.returncode != 0 and (r.stderr or "").strip():
-            (LOGDIR / f"{ts}-{role}.err").write_text(r.stderr)
-        (LOGDIR / f"{ts}-{role}.exit").write_text(str(r.returncode) + "\n")
-        log(f"{role} session finished, exit {r.returncode}")
-        return r.returncode
-    except subprocess.TimeoutExpired:
-        (LOGDIR / f"{ts}-{role}.exit").write_text("timeout\n")
-        log(f"{role} session timed out after {SESSION_TIMEOUT_S}s")
-        return 124
+        proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
     except FileNotFoundError:
         log("ABORT: vibe CLI not found on PATH")
         return None
+    _session_proc = proc
+    try:
+        stdout, stderr = proc.communicate(timeout=SESSION_TIMEOUT_S)
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        (LOGDIR / f"{ts}-{role}.exit").write_text("timeout\n")
+        log(f"{role} session timed out after {SESSION_TIMEOUT_S}s")
+        return 124
+    finally:
+        _session_proc = None
+    logfile.write_text(stdout or "")
+    if code != 0 and (stderr or "").strip():
+        (LOGDIR / f"{ts}-{role}.err").write_text(stderr)
+    (LOGDIR / f"{ts}-{role}.exit").write_text(str(code) + "\n")
+    log(f"{role} session finished, exit {code}")
+    if _shutdown["requested"]:
+        raise Shutdown()
+    return code
 
 
 def tick(dry):
@@ -247,15 +313,7 @@ def tick(dry):
         if dry:
             log("ABORT: working tree not clean")
             return "abort"
-        log("working tree not clean (interrupted session?); stashing, back to main")
-        stashed = run(["git", "stash", "-u"])
-        if stashed.returncode != 0:
-            log(f"ABORT: could not stash dirty tree: {stashed.stderr.strip()[:200]}")
-            return "abort"
-        notify.notify(f"{REPO_NAME}: recovered dirty working tree",
-                      "Stashed uncommitted changes left by an interrupted "
-                      "session; see `git stash list` in the clone.",
-                      tags="warning")
+        recover_dirty_tree()
     run(["git", "checkout", "main"])
     pull = run(["git", "pull", "--ff-only"])
     if pull.returncode != 0:
@@ -312,10 +370,14 @@ def tick(dry):
         state["resumed_blockers"].append(issue["number"])
         state["failures"] = {}  # fresh failure budget after owner input
         maybe_save(state, dry)
+        note = STASH_NOTE if state.get("stash_note_pending") else ""
         code = run_session("impl", RESUME_PROMPT.format(
-            number=issue["number"], title=issue["title"], answer=answer))
+            number=issue["number"], title=issue["title"], answer=answer) + note)
         if code is None:
             return "abort"
+        if code == 0:
+            state.pop("stash_note_pending", None)
+            maybe_save(state, dry)
         return "worked"
 
     # --- pull requests ---
@@ -425,11 +487,13 @@ def tick(dry):
         if dry:
             return "worked"
         maybe_save(state, dry)
-        code = run_session(role, PROMPTS[role].format(item=item))
+        note = STASH_NOTE if state.get("stash_note_pending") else ""
+        code = run_session(role, PROMPTS[role].format(item=item) + note)
         if code is None:
             return "abort"
         if code == 0:
             state["failures"].pop(item, None)
+            state.pop("stash_note_pending", None)
         else:
             fails = state["failures"].get(item, 0) + 1
             state["failures"][item] = fails
@@ -479,18 +543,28 @@ def acquire_lock():
 def main():
     dry = "--dry" in sys.argv
     loop = "--loop" in sys.argv
+    signal.signal(signal.SIGTERM, _request_shutdown)
     LOGDIR.mkdir(exist_ok=True)
     lock = acquire_lock()
     if lock is None:
         log("another dispatcher tick is already running; skipping")
         return 0
     status = None
-    while True:
-        status = tick(dry)
-        if dry or not loop or status != "worked":
-            break
-        log(f"--loop: cycle done; re-evaluating in {LOOP_SETTLE_S}s")
-        time.sleep(LOOP_SETTLE_S)
+    try:
+        while True:
+            if _shutdown["requested"]:
+                raise Shutdown()
+            status = tick(dry)
+            if dry or not loop or status != "worked":
+                break
+            log(f"--loop: cycle done; re-evaluating in {LOOP_SETTLE_S}s")
+            time.sleep(LOOP_SETTLE_S)
+    except Shutdown:
+        log("SIGTERM: gentle shutdown")
+        if not dry:
+            recover_dirty_tree()
+            run(["git", "checkout", "main"])
+        status = "worked"
     log(f"tick result: {status}")
     return 0 if status != "abort" else 1
 
