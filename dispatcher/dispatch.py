@@ -63,7 +63,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import notify  # noqa: E402
+import notify
 
 REPO = Path(__file__).resolve().parent.parent
 ROADMAP = REPO / "ROADMAP.md"
