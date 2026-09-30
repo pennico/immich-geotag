@@ -48,6 +48,7 @@ DATA_DIR = SCRIPT_DIR / "geotag-data"
 STATE_CSV = DATA_DIR / "state.csv"
 USAGE_FILE = DATA_DIR / "usage.json"
 BATCH_CSV = DATA_DIR / "batch.csv"
+REPORTS_DIR = DATA_DIR / "reports"
 FREE_PER_MONTH = int(os.environ.get("GEOTAG_MONTHLY_FREE", "1000"))
 
 
@@ -101,6 +102,37 @@ def merge_batch_into_state():
         w = csv.DictWriter(f, fieldnames=geotag.CSV_COLUMNS)
         w.writeheader()
         w.writerows(rows)
+
+
+def write_report(results, processed, located, applied, usage_total):
+    """Write this month's markdown report (one per calendar month).
+
+    Published to Nextcloud by the homelab's publish_geotag_outputs.sh
+    so results are readable from the phone over Tailscale.
+    """
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# Geotag monthly run — {month_key()}",
+        "",
+        f"- Processed: {processed} images",
+        f"- Located: {located}",
+        f"- Applied to Immich: {applied}",
+        f"- Vision units used this month: {usage_total} of {FREE_PER_MONTH}",
+        "",
+    ]
+    found = [r for r in results if r.get("status") in ("located", "applied")]
+    if found:
+        lines += ["## Locations found", "",
+                  "| Image | Place | Score | Maps |",
+                  "|---|---|---|---|"]
+        for r in found:
+            place = r.get("place") or "—"
+            maps = (f"[map]({r['maps_url']})" if r.get("maps_url") else "—")
+            lines.append(f"| {r.get('file_name', '')} | {place} "
+                         f"| {r.get('score', '')} | {maps} |")
+    path = REPORTS_DIR / f"{month_key()}.md"
+    path.write_text("\n".join(lines) + "\n")
+    log(f"report written: {path}")
 
 
 def notify(title, body, priority="default"):
@@ -214,6 +246,7 @@ def main():
     save_usage(usage)
     log(f"done: {processed} processed, {located} located, "
         f"{applied} applied; usage {month_key()}: {usage[month_key()]}")
+    write_report(results, processed, located, applied, usage[month_key()])
     notify("immich-geotag: monthly run done",
            f"{processed} images processed, {located} located, "
            f"{applied} locations written to Immich.\n"
