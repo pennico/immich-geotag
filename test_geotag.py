@@ -8,9 +8,6 @@ duplicate asset_id guard.
 Run: python3 test_geotag.py
 """
 
-import csv
-import io
-import json
 import os
 import shutil
 import sys
@@ -23,24 +20,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Import functions from geotag.py
 from geotag import (
-    ApiError,
     CSV_COLUMNS,
+    ApiError,
     Immich,
     asset_id_in_rows,
     clean_match_title,
     get_row_by_asset_id,
-    http_bytes,
-    http_json,
     lens_locate,
     load_env,
-    nominatim_search,
     multipart_post,
+    nominatim_search,
     read_csv,
     read_local_thumb,
     vision_landmark,
     write_csv,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake payloads
@@ -150,7 +144,7 @@ class TestCSVLayer(unittest.TestCase):
 
     def test_read_csv_empty_file(self):
         path = os.path.join(self.tmpdir, "empty.csv")
-        with open(path, "w") as f:
+        with open(path, "w"):
             pass
         rows = read_csv(path)
         self.assertEqual(rows, [])
@@ -179,7 +173,7 @@ class TestCSVLayer(unittest.TestCase):
              "score": "0.95", "status": "located", "maps_url": "https://maps..."},
         ]
         write_csv(path, rows)
-        with open(path, "r", newline="") as f:
+        with open(path, newline="") as f:
             content = f.read()
         self.assertIn("asset_id,file_name,latitude", content)
         self.assertIn("a1,IMG_001.jpg,48.85837", content)
@@ -208,7 +202,7 @@ class TestCSVLayer(unittest.TestCase):
              "place": "", "source": "", "score": "", "status": "pending", "maps_url": ""},
         ]
         write_csv(path, rows)
-        with open(path, "r", newline="") as f:
+        with open(path, newline="") as f:
             header = f.readline().strip()
         columns = header.split(",")
         self.assertEqual(columns, CSV_COLUMNS)
@@ -221,7 +215,7 @@ class TestCSVLayer(unittest.TestCase):
              "score": "0.9", "status": "located", "maps_url": ""},
         ]
         write_csv(path, rows)
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             content = f.read()
         self.assertIn("Törö.jpg", content)
 
@@ -351,7 +345,7 @@ class TestMultipartPost(unittest.TestCase):
 
         # Terminating boundary
         self.assertTrue(body.endswith(
-            "--{}--\r\n".format(boundary).encode("utf-8")))
+            f"--{boundary}--\r\n".encode()))
 
     @mock.patch("geotag.http_request")
     def test_multipart_post_http_error_raises(self, mock_request):
@@ -661,8 +655,9 @@ class TestScanWorkflow(unittest.TestCase):
         mock_immich = mock_immich_class.return_value
         mock_immich.assets_missing_geo.return_value = iter([FAKE_ASSET_MISSING_GEO])
 
-        from geotag import cmd_scan
         import argparse
+
+        from geotag import cmd_scan
         args = argparse.Namespace(out=os.path.join(self.tmpdir, "test.csv"),
                                   limit=None, asset_id=None)
 
@@ -686,8 +681,9 @@ class TestScanWorkflow(unittest.TestCase):
         mock_immich = mock_immich_class.return_value
         mock_immich.assets_missing_geo.return_value = iter([FAKE_ASSET_MISSING_GEO])
 
-        from geotag import cmd_scan
         import argparse
+
+        from geotag import cmd_scan
         csv_path = os.path.join(self.tmpdir, "test.csv")
 
         # First scan
@@ -734,8 +730,9 @@ class TestRecognizeWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_recognize
         import argparse
+
+        from geotag import cmd_recognize
         args = argparse.Namespace(
             csv=csv_path,
             min_score=0.5,
@@ -772,8 +769,9 @@ class TestRecognizeWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_recognize
         import argparse
+
+        from geotag import cmd_recognize
         args = argparse.Namespace(
             csv=csv_path,
             min_score=0.5,
@@ -859,8 +857,9 @@ class TestRecognizeWorkflow(unittest.TestCase):
         with open(thumb_path, "wb") as f:
             f.write(FAKE_PREVIEW_JPEG)
 
-        from geotag import cmd_recognize
         import argparse
+
+        from geotag import cmd_recognize
         args = argparse.Namespace(
             csv=csv_path,
             min_score=0.5,
@@ -981,7 +980,7 @@ class TestRecognizeWorkflow(unittest.TestCase):
         rows_after = read_csv(csv_path)
         self.assertEqual(rows_after[0]["status"], "pending")
         # No stray columns added to the schema
-        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        with open(csv_path, encoding="utf-8", newline="") as f:
             header = f.readline().strip()
         self.assertEqual(header.split(","), CSV_COLUMNS)
 
@@ -1044,8 +1043,9 @@ class TestApplyWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_apply
         import argparse
+
+        from geotag import cmd_apply
         args = argparse.Namespace(csv=csv_path, dry_run=True)
 
         with mock.patch.dict(os.environ, {
@@ -1074,8 +1074,9 @@ class TestApplyWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_apply
         import argparse
+
+        from geotag import cmd_apply
         args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
@@ -1099,8 +1100,9 @@ class TestApplyWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_apply
         import argparse
+
+        from geotag import cmd_apply
         args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
@@ -1124,8 +1126,9 @@ class TestApplyWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_apply
         import argparse
+
+        from geotag import cmd_apply
         args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
@@ -1158,8 +1161,9 @@ class TestApplyWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_apply
         import argparse
+
+        from geotag import cmd_apply
         args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
@@ -1189,8 +1193,9 @@ class TestApplyWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_apply
         import argparse
+
+        from geotag import cmd_apply
         args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
@@ -1217,8 +1222,9 @@ class TestApplyWorkflow(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_apply
         import argparse
+
+        from geotag import cmd_apply
         args = argparse.Namespace(csv=csv_path, dry_run=False)
 
         with mock.patch.dict(os.environ, {
@@ -1248,8 +1254,9 @@ class TestDuplicateAssetIdGuard(unittest.TestCase):
         """Multiple scan runs don't duplicate asset_id."""
         csv_path = os.path.join(self.tmpdir, "test.csv")
 
-        from geotag import cmd_scan
         import argparse
+
+        from geotag import cmd_scan
 
         args = argparse.Namespace(out=csv_path, limit=None, asset_id=None)
 
@@ -1298,8 +1305,9 @@ class TestResumeSkip(unittest.TestCase):
         ]
         write_csv(csv_path, rows)
 
-        from geotag import cmd_recognize
         import argparse
+
+        from geotag import cmd_recognize
         args = argparse.Namespace(
             csv=csv_path,
             min_score=0.5,

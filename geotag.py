@@ -30,7 +30,6 @@ import argparse
 import base64
 import csv
 import glob
-import io
 import json
 import os
 import re
@@ -69,7 +68,7 @@ def http_request(method, url, headers=None, body=None, timeout=90):
     except urllib.error.HTTPError as e:
         return e.code, e.read()
     except urllib.error.URLError as e:
-        raise ApiError("network error: {}".format(e.reason))
+        raise ApiError(f"network error: {e.reason}")
 
 
 def http_json(method, url, headers=None, payload=None, timeout=90):
@@ -99,18 +98,16 @@ def multipart_post(url, field, filename, content, extra_fields):
     parts = []
     for name, value in extra_fields.items():
         parts.append(
-            "--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n".format(
-                boundary, name, value).encode("utf-8"))
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
     parts.append(
-        "--{}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n"
-        "Content-Type: application/octet-stream\r\n\r\n".format(
-            boundary, field, filename).encode("utf-8"))
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n".encode())
     parts.append(content)
-    parts.append("\r\n--{}--\r\n".format(boundary).encode("utf-8"))
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
     body = b"".join(parts)
     status, data = http_request(
         "POST", url,
-        headers={"Content-Type": "multipart/form-data; boundary={}".format(boundary)},
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         body=body)
     if status >= 400:
         raise ApiError("POST {} -> HTTP {}: {}".format(
@@ -127,7 +124,7 @@ def load_env():
     path = os.path.join(SCRIPT_DIR, ".env")
     if not os.path.exists(path):
         return
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -151,7 +148,7 @@ def read_csv(path):
     rows = []
     if not os.path.exists(path):
         return rows
-    with open(path, "r", encoding="utf-8", newline="") as f:
+    with open(path, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append(row)
@@ -212,24 +209,24 @@ def read_local_thumb(thumbs_dir, asset_id):
     shard1, shard2 = asset_id[0:2], asset_id[2:4]
     exact = [
         os.path.join(thumbs_dir, shard1, shard2,
-                     "{}_preview.jpeg".format(asset_id)),
+                     f"{asset_id}_preview.jpeg"),
         os.path.join(thumbs_dir, shard1, shard2,
-                     "{}_preview.webp".format(asset_id)),
+                     f"{asset_id}_preview.webp"),
         os.path.join(thumbs_dir, shard1, shard2,
-                     "{}-preview.jpeg".format(asset_id)),
+                     f"{asset_id}-preview.jpeg"),
         os.path.join(thumbs_dir, shard1, shard2,
-                     "{}-preview.webp".format(asset_id)),
+                     f"{asset_id}-preview.webp"),
         os.path.join(thumbs_dir, shard1, shard2, asset_id + ".jpeg"),
     ]
     patterns = [
         os.path.join(thumbs_dir, "*", shard1, shard2,
-                     "{}_preview.jpeg".format(asset_id)),
+                     f"{asset_id}_preview.jpeg"),
         os.path.join(thumbs_dir, "*", shard1, shard2,
-                     "{}_preview.webp".format(asset_id)),
+                     f"{asset_id}_preview.webp"),
         os.path.join(thumbs_dir, "*", shard1, shard2,
-                     "{}-preview.jpeg".format(asset_id)),
+                     f"{asset_id}-preview.jpeg"),
         os.path.join(thumbs_dir, "*", shard1, shard2,
-                     "{}-preview.webp".format(asset_id)),
+                     f"{asset_id}-preview.webp"),
     ]
     for path in exact:
         if os.path.isfile(path):
@@ -311,11 +308,11 @@ class Immich:
             if data is not None:
                 return data
 
-        url = self._url("/assets/{}/thumbnail?size=preview".format(asset_id))
+        url = self._url(f"/assets/{asset_id}/thumbnail?size=preview")
         try:
             return http_bytes("GET", url, headers=self.headers)
         except ApiError:
-            return http_bytes("GET", self._url("/assets/{}/original".format(asset_id)),
+            return http_bytes("GET", self._url(f"/assets/{asset_id}/original"),
                               headers=self.headers)
 
     def set_location(self, asset_id, lat, lon):
@@ -390,7 +387,7 @@ def lens_locate(image_bytes, serpapi_key, email=None, max_matches=3):
                         image_bytes, {"api_key": serpapi_key})
     image_id = up.get("image_id")
     if not image_id:
-        raise ApiError("SerpApi upload returned no image_id: {}".format(up))
+        raise ApiError(f"SerpApi upload returned no image_id: {up}")
     qs = urllib.parse.urlencode({
         "engine": "google_lens", "image_id": image_id,
         "type": "visual_matches", "hl": "en", "api_key": serpapi_key,
@@ -459,7 +456,7 @@ def cmd_scan(args):
         print("No new missing-GPS assets found.")
     else:
         write_csv(out_path, all_rows)
-        print("Wrote {} new rows to {} (total: {})".format(len(new_rows), out_path, len(all_rows)))
+        print(f"Wrote {len(new_rows)} new rows to {out_path} (total: {len(all_rows)})")
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +481,7 @@ def cmd_recognize(args):
 
     csv_path = args.csv
     if not os.path.exists(csv_path):
-        sys.exit("CSV file not found: {}".format(csv_path))
+        sys.exit(f"CSV file not found: {csv_path}")
 
     rows = read_csv(csv_path)
     located = not_found = errors = skipped = 0
@@ -538,8 +535,7 @@ def cmd_recognize(args):
             row["source"] = "vision"
             row["score"] = str(score) if score is not None else ""
             row["status"] = "located"
-            row["maps_url"] = "https://www.google.com/maps?q={:.5f},{:.5f}".format(
-                lat_val, lon_val) if lat_val is not None and lon_val is not None else ""
+            row["maps_url"] = f"https://www.google.com/maps?q={lat_val:.5f},{lon_val:.5f}" if lat_val is not None and lon_val is not None else ""
             write_csv(csv_path, rows)  # crash-safe: write after each row
             located += 1
             print("{:40.40}  [vision] {} score={:.2f} -> {:.5f},{:.5f}".format(
@@ -562,13 +558,12 @@ def cmd_recognize(args):
                 row["source"] = "lens"
                 row["score"] = ""
                 row["status"] = "located"
-                row["maps_url"] = "https://www.google.com/maps?q={:.5f},{:.5f}".format(
-                    lat_val, lon_val) if lat_val is not None and lon_val is not None else ""
+                row["maps_url"] = f"https://www.google.com/maps?q={lat_val:.5f},{lon_val:.5f}" if lat_val is not None and lon_val is not None else ""
                 write_csv(csv_path, rows)  # crash-safe: write after each row
                 located += 1
                 print("{:40.40}  [lens] {} -> {:.5f},{:.5f}".format(
                     row.get("file_name", asset_id), name, lat_val, lon_val))
-                print("    geocoded as: {}".format(detail))
+                print(f"    geocoded as: {detail}")
                 continue
 
         # No match found
@@ -578,8 +573,7 @@ def cmd_recognize(args):
         print("{:40.40}  no location found".format(row.get("file_name", asset_id)))
 
     print("-" * 78)
-    print("done: {} located, {} not_found, {} errors, {} skipped".format(
-        located, not_found, errors, skipped))
+    print(f"done: {located} located, {not_found} not_found, {errors} errors, {skipped} skipped")
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +596,7 @@ def cmd_apply(args):
 
     csv_path = args.csv
     if not os.path.exists(csv_path):
-        sys.exit("CSV file not found: {}".format(csv_path))
+        sys.exit(f"CSV file not found: {csv_path}")
 
     rows = read_csv(csv_path)
     dry_run = args.dry_run
@@ -655,12 +649,10 @@ def cmd_apply(args):
 
     print("-" * 78)
     if dry_run:
-        print("dry run: {} would be written, {} errors, {} skipped".format(
-            written, errors, skipped))
+        print(f"dry run: {written} would be written, {errors} errors, {skipped} skipped")
         print("(re-run without --dry-run to write to Immich)")
     else:
-        print("done: {} written, {} errors, {} skipped".format(
-            written, errors, skipped))
+        print(f"done: {written} written, {errors} errors, {skipped} skipped")
 
 
 # ---------------------------------------------------------------------------
