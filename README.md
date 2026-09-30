@@ -35,6 +35,10 @@ landmark-detection units per calendar month, automatically:
   manual review flow).
 - Notifies via ntfy (`NTFY_SERVER`/`NTFY_TOPIC`); `--dry` plans without
   API calls, `--limit N` caps a run.
+- Writes a per-month markdown report `geotag-data/reports/YYYY-MM.md`
+  (counts + the locations found); on the homelab it is published to
+  Nextcloud (`immich-geotag/`) so results are readable from the phone
+  over Tailscale.
 
 ```bash
 python3 monthly_geotag.py --dry         # plan only
@@ -51,5 +55,6 @@ documented in pennico-ops `homelab/README.md` ("Monthly geotag job").
 ## Data files
 
 `geotag-data/` (gitignored) holds the run state: `state.csv` (ledger),
-`usage.json` (monthly spend), `batch.csv` (current run). CSVs with
+`usage.json` (monthly spend), `batch.csv` (current run), and
+`reports/` (one markdown report per month). CSVs with
 personal photo data are never committed.
