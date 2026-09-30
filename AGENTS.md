@@ -5,6 +5,11 @@ missing-GPS assets → recognize locations (Google Cloud Vision landmarks,
 SerpApi Google Lens fallback geocoded via Nominatim) → review in a CSV →
 apply approved coordinates back to Immich.
 
+Cross-cutting operational standards (homelab environment, quotas,
+scheduled jobs, publish pipeline) live in
+[AGENTIC_WORK_STANDARDS.md](https://github.com/pennico/pennico-ops/blob/main/AGENTIC_WORK_STANDARDS.md)
+in pennico-ops.
+
 `PLAN.md` is the complete, approved spec AND architecture: target design
 (three subcommands, CSV as review buffer), verified API reference, build
 steps 1–7, caveats. Read it first and follow it — do not redesign. The
