@@ -8,3 +8,4 @@ __pycache__/
 .DS_Store
 dispatcher/state.json
 geotag-data/
+dispatcher/feedback_state.json

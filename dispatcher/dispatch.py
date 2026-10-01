@@ -65,6 +65,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import notify
 
+try:
+    import feedback
+except ImportError:  # older engine copies without feedback.py
+    feedback = None
+
 REPO = Path(__file__).resolve().parent.parent
 ROADMAP = REPO / "ROADMAP.md"
 LOGDIR = REPO / "dispatcher" / "logs"
@@ -407,6 +412,28 @@ def run_session(role, prompt):
     return code
 
 
+def report_session_failure(source, title):
+    """Feed a failed session back into the loop as a diagnosis task issue.
+
+    First failure of a signature files a `task` issue (an agent session
+    picks it up next tick); recurrences comment on it and eventually
+    escalate to `blocker`. No-op when feedback.py is not present.
+    """
+    if feedback is None:
+        return
+    exits = sorted(LOGDIR.glob(f"*-{source}.exit"))
+    tail = ""
+    errfile = LOGDIR / (exits[-1].stem + ".err") if exits else None
+    if errfile is not None and errfile.exists():
+        tail = "\n".join(errfile.read_text(errors="replace").splitlines()[-40:])
+    elif exits:
+        logfile = LOGDIR / (exits[-1].stem + ".json")
+        if logfile.exists():
+            tail = "\n".join(logfile.read_text(errors="replace").splitlines()[-5:])
+    feedback.report(f"session:{REPO_NAME}:{source}", REPO_NAME,
+                   f"{source} session failed: {title}", tail or "(no output)")
+
+
 def tick(dry):
     """One pass over the state machine.
 
@@ -526,6 +553,10 @@ def tick(dry):
             fails = state["failures"].get(key, 0) + 1
             state["failures"][key] = fails
             log(f"task session failed (exit {code}); failures: {fails}")
+            if fails < FAIL_STRIKES:
+                # Feed the failure back: a diagnosis task issue gives the
+                # loop one self-fix attempt before human escalation.
+                report_session_failure("impl", issue["title"])
             if fails >= FAIL_STRIKES:
                 run(["gh", "issue", "comment", str(n), "--body",
                      "The dispatcher could not complete this task in two "
@@ -690,6 +721,10 @@ def tick(dry):
             fails = state["failures"].get(item, 0) + 1
             state["failures"][item] = fails
             log(f"session failed (exit {code}); failures for this item: {fails}")
+            if fails < FAIL_STRIKES:
+                # Feed the failure back: a diagnosis task issue gives the
+                # loop one self-fix attempt before human escalation.
+                report_session_failure(role, item)
             if fails >= FAIL_STRIKES:
                 n = file_blocker(
                     f"Roadmap item failed twice: {item}",
