@@ -159,6 +159,15 @@ def resolve(source):
     log(f"resolved source '{source}': closed {closed} issue(s)")
 
 
+def full_repo(repo):
+    """gh wants OWNER/REPO; accept bare names and prefix the login."""
+    if "/" in repo:
+        return repo
+    r = run(["gh", "api", "user", "--jq", ".login"])
+    owner = r.stdout.strip() if r.returncode == 0 else ""
+    return f"{owner}/{repo}" if owner else repo
+
+
 def read_tail(args):
     if args.log:
         text = Path(args.log).read_text(errors="replace")
@@ -185,8 +194,8 @@ def main():
     sp.add_argument("--source", required=True)
     args = p.parse_args()
     if args.cmd == "report":
-        report(args.source, args.repo, args.title, read_tail(args),
-               args.max_auto)
+        report(args.source, full_repo(args.repo), args.title,
+               read_tail(args), args.max_auto)
     else:
         resolve(args.source)
 
