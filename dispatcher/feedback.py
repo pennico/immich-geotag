@@ -115,8 +115,10 @@ def report(source, repo, title, tail, max_auto=DEFAULT_MAX_AUTO):
             log(f"escalated {entry['repo']}#{entry['issue']} to blocker "
                 f"after {attempts} attempts")
             notify.notify(f"{repo}: auto-fix gave up",
-                          f"Failure '{error_line(tail)}' recurred {attempts} "
-                          f"times (issue #{entry['issue']}). Needs a human.",
+                          f"#{entry['issue']} {error_line(tail)}\n\n"
+                          f"The same failure recurred {attempts} times; "
+                          "auto-fix gave up. Comment on the issue and add "
+                          "the `answered` label (or reply here) to resume.",
                           priority="high", tags="warning")
         save_state(state)
         return entry["issue"]
@@ -136,7 +138,10 @@ def report(source, repo, title, tail, max_auto=DEFAULT_MAX_AUTO):
         save_state(state)
         log(f"filed {repo}#{n} for '{sig}'")
         notify.notify(f"{repo}: failure auto-reported",
-                      f"{title} — issue #{n} filed for an agent session.",
+                      f"#{n} {title}\n\n"
+                      "A diagnosis issue was filed; an agent session will "
+                      "pick it up and self-fix. No action needed unless "
+                      "this repeats.",
                       tags="gear")
     return n
 
