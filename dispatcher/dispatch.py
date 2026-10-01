@@ -75,6 +75,7 @@ ROADMAP = REPO / "ROADMAP.md"
 LOGDIR = REPO / "dispatcher" / "logs"
 STATE_FILE = REPO / "dispatcher" / "state.json"
 LOCK_FILE = REPO / "dispatcher" / ".lock"
+PUBLISH_FLAGS = REPO.parent / ".publish-flags"
 MAX_TURNS = "150"
 MAX_PRICE = os.environ.get("DISPATCH_MAX_PRICE", "10")
 SESSION_TIMEOUT_S = 5400
@@ -412,6 +413,20 @@ def run_session(role, prompt):
     return code
 
 
+def request_publish():
+    """Ask the host-side watcher to publish this repo's outputs.
+
+    Drops a flag file in <projects>/.publish-flags/ (outside the repo, on
+    the bind mount); the watcher cron runs publish_<repo>_outputs.sh and
+    notifies the owner. Best-effort: never fails a tick.
+    """
+    try:
+        PUBLISH_FLAGS.mkdir(exist_ok=True)
+        (PUBLISH_FLAGS / REPO_NAME).touch()
+    except OSError as e:
+        log(f"could not request publish: {e}")
+
+
 def report_session_failure(source, title):
     """Feed a failed session back into the loop as a diagnosis task issue.
 
@@ -511,6 +526,7 @@ def tick(dry):
             return "abort"
         if code == 0:
             state.pop("stash_note_pending", None)
+            request_publish()
             maybe_save(state, dry)
         return "worked"
 
@@ -549,6 +565,7 @@ def tick(dry):
         if code == 0:
             state["failures"].pop(key, None)
             state.pop("stash_note_pending", None)
+            request_publish()
         else:
             fails = state["failures"].get(key, 0) + 1
             state["failures"][key] = fails
@@ -608,6 +625,7 @@ def tick(dry):
             if dry:
                 continue
             if merge(p["number"], p["title"], p.get("isDraft", False)):
+                request_publish()
                 state["qa_strikes"].pop(str(p["number"]), None)
                 state["approved_prs"] = [n for n in state["approved_prs"]
                                          if n != p["number"]]
@@ -717,6 +735,7 @@ def tick(dry):
         if code == 0:
             state["failures"].pop(item, None)
             state.pop("stash_note_pending", None)
+            request_publish()
         else:
             fails = state["failures"].get(item, 0) + 1
             state["failures"][item] = fails
