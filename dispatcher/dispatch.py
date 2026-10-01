@@ -358,10 +358,10 @@ def recover_dirty_tree():
         state["stash_note_pending"] = True
         state["notified_branches"] = known + new_branches
         save_state(state)
-        notify.notify(f"{REPO_NAME}: recovered work from an interrupted session",
+        notify.notify(f"{REPO_NAME}: recovered interrupted session",
                       "Stashed uncommitted changes and/or found unpushed "
-                      "branches; see `git stash list` and `git branch` in "
-                      "the clone.",
+                      "branches from an interrupted session; the next "
+                      "session resumes from them. No action needed.",
                       tags="warning")
     elif branches:
         # known leftovers: keep the note flag fresh, stay quiet
@@ -488,8 +488,11 @@ def tick(dry):
             state["seen_blockers"].append(issue["number"])
             log(f"blocker issue #{issue['number']} ({issue['state'].lower()}): {issue['title']}")
             if not dry and issue["state"] == "OPEN":
-                notify.notify(f"{REPO_NAME}: blocked",
-                              f"#{issue['number']} {issue['title']} — answer to resume",
+                notify.notify(f"{REPO_NAME}: needs your answer",
+                              f"#{issue['number']} {issue['title']}\n\n"
+                              "Reply to this message (Telegram) or comment "
+                              "on the issue and add the `answered` label — "
+                              "the loop resumes within ~5 min.",
                               priority="high", tags="warning", url=issue.get("url"))
     actionable, open_unanswered = [], []
     for issue in blockers:
@@ -555,7 +558,10 @@ def tick(dry):
         maybe_save(state, dry)
         log(f"task issue #{n}: {issue['title']}")
         notify.notify(f"{REPO_NAME}: task launched",
-                      f"#{n} {issue['title']}", tags="rocket", url=issue.get("url"))
+                      f"#{n} {issue['title']}\n\n"
+                      "Implementation session running (up to 90 min). "
+                      "No action needed — next update when a PR opens.",
+                      tags="rocket", url=issue.get("url"))
         note = STASH_NOTE if state.get("stash_note_pending") else ""
         code = run_session("impl", TASK_PROMPT.format(
             number=n, title=issue["title"], body=body, comments=ctext) + note)
@@ -581,8 +587,11 @@ def tick(dry):
                      "comment here and add the `answered` label to resume."])
                 run(["gh", "issue", "edit", str(n), "--add-label", "blocker"])
                 state["seen_blockers"].append(n)
-                notify.notify(f"{REPO_NAME}: paused",
-                              f"task #{n} failed twice — needs a look",
+                notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                              f"#{n} {issue['title']}\n\n"
+                              "Two sessions failed on this task. Comment on "
+                              "the issue and add the `answered` label (or "
+                              "reply here) to resume.",
                               priority="high", tags="warning", url=issue.get("url"))
                 maybe_save(state, dry)
                 return "blocked"
@@ -599,7 +608,10 @@ def tick(dry):
             log(f"new PR #{p['number']}: {p['title']}")
             if not dry:
                 notify.notify(f"{REPO_NAME}: PR opened",
-                              f"#{p['number']} {p['title']}",
+                              f"#{p['number']} {p['title']}\n\n"
+                              "No action needed — QA and adversarial "
+                              "reviews run automatically; you'll be "
+                              "notified when it merges.",
                               tags="envelope", url=p.get("url"))
     if prs:
         # Merge PRs with BOTH review labels + green checks first (cheap gh
@@ -615,7 +627,9 @@ def tick(dry):
                 log(f"PR #{p['number']} approved by both reviewers")
                 if not dry:
                     notify.notify(f"{REPO_NAME}: PR approved",
-                                  f"#{p['number']} {p['title']} — will merge",
+                                  f"#{p['number']} {p['title']}\n\n"
+                                  "Both reviews passed; merging as soon as "
+                                  "CI is green. No action needed.",
                                   tags="ok", url=p.get("url"))
             if not checks_pass(p["number"]):
                 log(f"PR #{p['number']} approved but checks not green; waiting")
@@ -630,14 +644,19 @@ def tick(dry):
                 state["approved_prs"] = [n for n in state["approved_prs"]
                                          if n != p["number"]]
                 notify.notify(f"{REPO_NAME}: PR merged",
-                              f"#{p['number']} {p['title']}",
+                              f"#{p['number']} {p['title']}\n\n"
+                              "Outputs will be published to Nextcloud "
+                              "Documents/04_projects/ within ~5 min. "
+                              "No action needed.",
                               tags="white_check_mark", url=p.get("url"))
             else:
                 waiting = True
                 if p["number"] not in state["merge_failed_prs"]:
                     state["merge_failed_prs"].append(p["number"])
                     notify.notify(f"{REPO_NAME}: merge failed",
-                                  f"#{p['number']} {p['title']} — merge error, needs a look",
+                                  f"#{p['number']} {p['title']}\n\n"
+                                  "Merge error — the loop retries on its "
+                                  "next tick; if this repeats, check the PR.",
                                   priority="high", tags="warning", url=p.get("url"))
         # Two-reviewer pipeline: one review session per tick. Correctness
         # (QA) first; adversarial only after correctness approved.
@@ -683,8 +702,12 @@ def tick(dry):
                         "here and add the `answered` label to resume.")
                     if b:
                         state["seen_blockers"].append(b)
-                        notify.notify(f"{REPO_NAME}: paused",
-                                      f"PR #{n} failed review after rework — needs a look",
+                        notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                      f"#{b} {p['title']}\n\n"
+                                      f"PR #{n} failed {QA_STRIKES} review "
+                                      "rounds. Comment on the issue and add "
+                                      "the `answered` label (or reply here) "
+                                      "to resume.",
                                       priority="high", tags="warning", url=p.get("url"))
                     pause = True
                     continue
@@ -718,8 +741,11 @@ def tick(dry):
                 "`answered` label to resume.")
             if n:
                 state["seen_blockers"].append(n)
-                notify.notify(f"{REPO_NAME}: paused",
-                              f"item failed twice, needs a look: {item}",
+                notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                              f"#{n} roadmap item failed twice\n\n"
+                              f"Item: {item}\n\n"
+                              "Comment on the issue and add the `answered` "
+                              "label (or reply here) to resume.",
                               priority="high", tags="warning")
                 maybe_save(state, dry)
                 return "blocked"
@@ -753,8 +779,11 @@ def tick(dry):
                     "the `answered` label to resume.")
                 if n:
                     state["seen_blockers"].append(n)
-                    notify.notify(f"{REPO_NAME}: paused",
-                                  f"item failed twice, needs a look: {item}",
+                    notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                  f"#{n} roadmap item failed twice\n\n"
+                                  f"Item: {item}\n\n"
+                                  "Comment on the issue and add the `answered` "
+                                  "label (or reply here) to resume.",
                                   priority="high", tags="warning")
                     maybe_save(state, dry)
                     return "blocked"
@@ -768,7 +797,9 @@ def tick(dry):
         state["notified_done"] = True
         if not dry:
             notify.notify(f"{REPO_NAME}: roadmap done",
-                          "All ROADMAP.md items are checked; dispatcher is idle.",
+                          "All ROADMAP.md items are checked; the dispatcher "
+                          "is idle. No action needed — file new work via a "
+                          "`task` issue or /task on Telegram.",
                           priority="high", tags="tada")
     maybe_save(state, dry)
     return "idle"
