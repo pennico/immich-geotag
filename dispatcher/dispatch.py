@@ -100,7 +100,10 @@ Roadmap item for this session: {item}
 
 Follow the hard constraints and decision defaults in AGENTS.md. Work on a
 new branch, commit incrementally, open a draft PR with a Handoff section,
-and tick the matching checkbox in ROADMAP.md as part of your PR. If you are
+and tick the matching checkbox in ROADMAP.md as part of your PR. If the
+work involves a design choice that changes what the results mean (what
+is counted, excluded, grouped, or named), ask the owner before building:
+file a blocker with the options instead of guessing and building. If you are
 blocked (question only the owner can answer, live validation needed, work
 outside the build steps), open a GitHub issue labeled `blocker`
 (`gh issue create --label blocker`) and stop cleanly. Write blockers in
@@ -183,7 +186,11 @@ the problem, and fix it. If a fix is not warranted, comment your findings
 on issue #{number} and close it instead. Follow the hard constraints and
 decision defaults in AGENTS.md. Work on a new branch, commit incrementally,
 open a draft PR with a Handoff section referencing issue #{number}, then
-close issue #{number} with a short comment linking the PR. If you are
+close issue #{number} with a short comment linking the PR. If the task
+involves a design choice that changes what the results mean (what is
+counted, excluded, grouped, or named), ask the owner before building:
+comment the options on issue #{number}, add the `blocker` label, and
+stop cleanly instead of guessing and building. If you are
 blocked (question only the owner can answer), comment on issue #{number}
 in plain language for a non-developer on a phone — "What I was doing /
 What I need from you / the options if any", ending with: "How to answer:
