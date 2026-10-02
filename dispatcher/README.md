@@ -17,6 +17,14 @@ anyone launching sessions manually.
 4. No PRs -> Implementation session on the first unchecked ROADMAP.md item
    (every chunk is an [impl] session).
 5. Roadmap complete -> idle + one "roadmap done" notification.
+6. Delivery verification: when the loop considers the delivery complete
+   (a PR merged, and once per idle period), a verification session asks
+   "Has the project fulfilled its scope and are all the deliverables
+   completed, and stored correctly?" — gaps come back as `[verify]` task
+   issues the loop schedules fixes for; a clean pass notifies the owner.
+   An approved PR with red CI gets one automatic fix session (the fix
+   re-enters the review pipeline) before the dispatcher escalates to a
+   blocker.
 
 ## Modes
 
