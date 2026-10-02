@@ -85,6 +85,13 @@ LOOP_SETTLE_S = 30  # pause between sessions in --loop mode
 REPO_NAME = "immich-geotag"
 ADV_LABEL = "approved-adversarial"
 
+# Appended to every dispatcher-filed blocker: the owner is a non-developer
+# reading these on a phone; the answer mechanism must be spelled out.
+BLOCKER_HOWTO = ("\n\n---\n\n**How to answer:** comment below, then add the "
+                 "`answered` label (gear icon → Labels → answered) — or "
+                 "just reply to the Telegram notification. The loop "
+                 "resumes within ~5 min of your answer.")
+
 IMPL_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
 Read AGENTS.md first, then PLAN.md — it is the complete approved spec.
 Follow it literally; do not redesign.
@@ -96,7 +103,11 @@ new branch, commit incrementally, open a draft PR with a Handoff section,
 and tick the matching checkbox in ROADMAP.md as part of your PR. If you are
 blocked (question only the owner can answer, live validation needed, work
 outside the build steps), open a GitHub issue labeled `blocker`
-(`gh issue create --label blocker`) and stop cleanly. When done: push the
+(`gh issue create --label blocker`) and stop cleanly. Write blockers in
+plain language for a non-developer on a phone: "What I was doing /
+What I need from you / the options if any", and end with: "How to
+answer: comment here and add the `answered` label, or reply to the
+Telegram notification." When done: push the
 branch, then `git checkout main` so the working tree is left clean."""
 
 QA_PROMPT = """You are the QA (correctness) agent for this repository (unattended headless run).
@@ -173,8 +184,12 @@ on issue #{number} and close it instead. Follow the hard constraints and
 decision defaults in AGENTS.md. Work on a new branch, commit incrementally,
 open a draft PR with a Handoff section referencing issue #{number}, then
 close issue #{number} with a short comment linking the PR. If you are
-blocked (question only the owner can answer), comment on issue #{number},
-add the `blocker` label (`gh issue edit {number} --add-label blocker`),
+blocked (question only the owner can answer), comment on issue #{number}
+in plain language for a non-developer on a phone — "What I was doing /
+What I need from you / the options if any", ending with: "How to answer:
+comment here and add the `answered` label, or reply to the Telegram
+notification." — then add the `blocker` label
+(`gh issue edit {number} --add-label blocker`),
 and stop cleanly. When done: push the branch, then `git checkout main` so
 the working tree is left clean."""
 
@@ -287,6 +302,7 @@ def issue_comments(number):
 
 
 def file_blocker(title, body):
+    body = body + BLOCKER_HOWTO
     r = run(["gh", "issue", "create", "--label", "blocker",
              "--title", title, "--body", body])
     if r.returncode != 0:
