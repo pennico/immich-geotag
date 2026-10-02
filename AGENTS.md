@@ -94,5 +94,9 @@ resume, or signal another session. The repo is the only coordination bus.
   answers in a comment, and adds the `answered` label — the dispatcher
   then resumes with your issue and the owner's answer quoted in the
   prompt. Close the issue once your resumed session has resolved it.
+- Design choices that change what results mean (what is counted,
+  excluded, grouped, or named) are owner decisions: ask before
+  building — file a blocker with the options instead of guessing
+  and building.
 - Never wait idly for another agent — either proceed with work that is
   within your role, or stop with the issue filed.
