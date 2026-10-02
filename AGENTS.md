@@ -87,9 +87,12 @@ resume, or signal another session. The repo is the only coordination bus.
 - If you are blocked (question only the owner can answer, live validation
   needed, work outside the build steps), **open a GitHub issue labeled
   `blocker`** (`gh issue create --label blocker --title ... --body ...`)
-  and stop cleanly. The owner gets a push notification, answers in a
-  comment, and adds the `answered` label — the dispatcher then resumes
-  with your issue and the owner's answer quoted in the prompt. Close the
-  issue once your resumed session has resolved it.
+  and stop cleanly. Write it in plain language for a non-developer on a
+  phone: what you were doing, what you need from them, the options if
+  any, and end with how to answer (comment + `answered` label, or reply
+  to the Telegram notification). The owner gets a push notification,
+  answers in a comment, and adds the `answered` label — the dispatcher
+  then resumes with your issue and the owner's answer quoted in the
+  prompt. Close the issue once your resumed session has resolved it.
 - Never wait idly for another agent — either proceed with work that is
   within your role, or stop with the issue filed.
