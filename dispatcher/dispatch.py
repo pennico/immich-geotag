@@ -31,6 +31,15 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
      item (a role tag in the item text selects the prompt; default impl).
   6. Else: idle (roadmap complete) -> notify once.
 
+Delivery verification: when the loop considers the delivery complete —
+after a PR merges, and once when a repo goes idle — a verification
+session asks: "Has the project fulfilled its scope and are all the
+deliverables completed, and stored correctly?" Gaps are filed as
+`[verify]` task issues the loop picks up next tick; a clean pass notifies
+the owner. An approved PR whose CI stays red gets one automatic fix
+session (the fix re-enters the review pipeline) before the dispatcher
+escalates to a blocker.
+
 Failure budget: dispatcher/state.json counts consecutive failed sessions
 (non-zero exit or timeout) per roadmap item. 2 strikes on the same item ->
 the dispatcher files a blocker issue and pauses the repo; the owner's
@@ -163,6 +172,54 @@ review findings: `gh pr view {number} --comments` and `gh pr diff {number}`.
 When done: push the branch, then `git checkout main` so the working tree is
 left clean."""
 
+CI_FIX_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
+PR #{number} "{title}" passed both reviews, but its CI checks are failing,
+so it cannot merge.
+- `gh pr checkout {number}` to get the PR branch.
+- Find the failure: `gh run list --branch "$(git branch --show-current)" \
+--limit 1` then `gh run view <run-id> --log-failed`; reproduce it locally
+with the same commands the workflow runs.
+- Fix it with a minimal change pushed to the PR branch. If the code is
+  correct but the CI environment lacks something (a system dependency, a
+  missing step in the workflow), fix the workflow instead. If the code is
+  wrong, fix the code.
+- Do not remove review labels, do not merge. Your fix re-enters the
+  review pipeline automatically.
+When done: push the branch, then `git checkout main` so the working tree is
+left clean."""
+
+VERIFY_PROMPT = """You are the Delivery Verification agent for this repository (unattended headless run).
+The loop considers the delivery complete: {delivered}.
+Answer one question, with evidence:
+
+  Has the project fulfilled its scope, and are all the deliverables
+  completed and stored correctly?
+
+Read AGENTS.md first. Establish the scope: ROADMAP.md / plan docs, and
+the recently merged PRs and closed issues (`gh pr list --state merged
+--limit 5`, `gh issue list --state closed --limit 10`). Then verify —
+inspect and run things; never trust PR descriptions:
+- Scope: everything promised as delivered actually is; nothing accepted
+  is silently missing or half-done.
+- Deliverables: the artifacts exist where this project's standards
+  require them (source committed, outputs under data/out/ with the
+  agreed layout, docs updated in the same change).
+- Storage: right place, right names; nothing stranded on unmerged
+  branches, stashes, or untracked files (`git status`, `git stash list`,
+  `git branch --no-merged main`).
+- Publishing to Nextcloud is asynchronous (host watcher, ~5 min after
+  the publish flag): check data/out in the repo, not the mirror.
+
+Verdict — exactly one of:
+- All complete and stored correctly: take no action (no issue, no
+  comment).
+- Gaps found: file ONE GitHub issue labeled `task` with a title starting
+  with `[verify]`, listing each gap in plain language: what is missing,
+  where it should be, and what done looks like. The loop schedules the
+  fix automatically.
+Do not modify code, do not merge, do not close or label existing issues.
+When done: `git checkout main` so the working tree is left clean."""
+
 RESUME_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
 The owner has answered blocker issue #{number}: "{title}"
 Owner's answer: {answer}
@@ -276,12 +333,17 @@ def pr_labels(number):
     return {l["name"] for l in data.get("labels", [])}
 
 
-def checks_pass(number):
+def checks_state(number):
+    """'green', 'pending', or 'failed' for a PR's checks."""
     r = run(["gh", "pr", "checks", str(number)])
     if r.returncode == 0:
-        return True
+        return "green"
     # Repos without CI: "no checks reported" counts as green.
-    return "no checks reported" in (r.stderr or "")
+    if "no checks reported" in (r.stderr or ""):
+        return "green"
+    if "fail" in (r.stdout or "").lower():
+        return "failed"
+    return "pending"
 
 
 def merge(number, title, is_draft=False):
@@ -301,6 +363,11 @@ def merge(number, title, is_draft=False):
 def blocker_issues():
     return gh_json(["gh", "issue", "list", "--label", "blocker", "--state", "all",
                     "--json", "number,title,state,labels,url"]) or []
+
+def task_issues():
+    return gh_json(["gh", "issue", "list", "--label", "task",
+                    "--state", "open", "--json", "number,title"]) or []
+
 
 
 def issue_comments(number):
@@ -472,6 +539,40 @@ def report_session_failure(source, title):
                    f"{source} session failed: {title}", tail or "(no output)")
 
 
+def verify_delivery(delivered, dry):
+    """Run the delivery-verification session and report the verdict.
+
+    Asks the verification question ("has the project fulfilled its scope
+    and are all deliverables completed and stored correctly?") as a
+    session. The session files a `[verify]` task issue for gaps (the
+    loop picks it up next tick); silence means pass. Never blocks the
+    tick: a failed session is fed to the feedback loop, not the budget.
+    """
+    if dry:
+        log(f"would run delivery verification: {delivered}")
+        return
+    before = {i["number"] for i in task_issues()}
+    code = run_session("verify", VERIFY_PROMPT.format(delivered=delivered))
+    if code is None or code != 0:
+        log(f"verification session failed (exit {code}); no verdict")
+        report_session_failure("verify", delivered)
+        return
+    gaps = [i for i in task_issues() if i["number"] not in before]
+    if gaps:
+        log(f"delivery verification found gaps: {[i['title'] for i in gaps]}")
+        notify.notify(f"{REPO_NAME}: delivery check found gaps",
+                      "\n\n".join(i["title"] for i in gaps) +
+                      "\n\nA fix session was queued automatically; "
+                      "no action needed.",
+                      tags="warning")
+    else:
+        log("delivery verification passed")
+        notify.notify(f"{REPO_NAME}: delivery verified",
+                      "Scope fulfilled; deliverables complete and stored "
+                      "correctly. No action needed.",
+                      tags="ok")
+
+
 def tick(dry):
     """One pass over the state machine.
 
@@ -496,6 +597,8 @@ def tick(dry):
                          ("seen_blockers", []), ("resumed_blockers", []),
                          ("seen_prs", []), ("approved_prs", []),
                          ("launched_tasks", []), ("merge_failed_prs", []),
+                         ("ci_fix_tried", []), ("ci_escalated", []),
+                         ("verified_merges", []), ("verified_idle", False),
                          ("notified_done", False)):
         state.setdefault(key, default)
 
@@ -543,6 +646,9 @@ def tick(dry):
         log(f"blocker #{issue['number']} answered; resuming")
         run(["gh", "issue", "edit", str(issue["number"]), "--remove-label", "answered"])
         state["resumed_blockers"].append(issue["number"])
+        state["verified_idle"] = False  # new work: re-verify before idle again
+        state["ci_fix_tried"] = []     # fresh CI-fix budget too
+        state["ci_escalated"] = []
         state["failures"] = {}  # fresh failure budget after owner input
         maybe_save(state, dry)
         note = STASH_NOTE if state.get("stash_note_pending") else ""
@@ -578,6 +684,7 @@ def tick(dry):
                 f"- {c.get('author', {}).get('login', '?')}: "
                 f"{(c.get('body') or '').strip()}" for c in comments)
         state["launched_tasks"].append(n)
+        state["verified_idle"] = False  # new work: re-verify before idle again
         maybe_save(state, dry)
         log(f"task issue #{n}: {issue['title']}")
         notify.notify(f"{REPO_NAME}: task launched",
@@ -628,6 +735,7 @@ def tick(dry):
     for p in prs:
         if p["number"] not in state["seen_prs"]:
             state["seen_prs"].append(p["number"])
+            state["verified_idle"] = False  # new work arrived
             log(f"new PR #{p['number']}: {p['title']}")
             if not dry:
                 notify.notify(f"{REPO_NAME}: PR opened",
@@ -654,8 +762,64 @@ def tick(dry):
                                   "Both reviews passed; merging as soon as "
                                   "CI is green. No action needed.",
                                   tags="ok", url=p.get("url"))
-            if not checks_pass(p["number"]):
-                log(f"PR #{p['number']} approved but checks not green; waiting")
+            state_ = checks_state(p["number"])
+            if state_ == "failed":
+                if p["number"] not in state.get("ci_failed_prs", []):
+                    state.setdefault("ci_failed_prs", []).append(p["number"])
+                    if not dry:
+                        notify.notify(f"{REPO_NAME}: CI failed on approved PR",
+                                      f"#{p['number']} {p['title']}\n\n"
+                                      "CI is red, so the merge is on hold. "
+                                      "The loop will try to fix it "
+                                      "automatically; you'll be notified "
+                                      "if it needs you.",
+                                      priority="high", tags="warning",
+                                      url=p.get("url"))
+                if p["number"] not in state["ci_fix_tried"]:
+                    # One self-fix attempt before human escalation.
+                    state["ci_fix_tried"].append(p["number"])
+                    log(f"PR #{p['number']}: CI red after approval; "
+                        "launching fix session")
+                    maybe_save(state, dry)
+                    if dry:
+                        log(f"would run CI fix session for PR #{p['number']}")
+                    else:
+                        run_session("impl", CI_FIX_PROMPT.format(
+                            number=p["number"], title=p["title"]))
+                        # The fix pushed new code: re-verify correctness
+                        # before it can merge (same rule as rework).
+                        run(["gh", "pr", "edit", str(p["number"]),
+                             "--remove-label", "approved"])
+                elif p["number"] not in state["ci_escalated"]:
+                    state["ci_escalated"].append(p["number"])
+                    log(f"PR #{p['number']}: CI still red after fix attempt; "
+                        "escalating to the owner")
+                    if dry:
+                        log(f"would file blocker: CI keeps failing on PR #{p['number']}")
+                    else:
+                        b = file_blocker(
+                            f"CI keeps failing on approved PR #{p['number']}: {p['title']}",
+                            f"PR #{p['number']} passed both reviews, but its "
+                            "automated checks (CI) keep failing even after "
+                            "an automatic fix attempt (see the PR's Checks "
+                            "tab, link below). The dispatcher paused this "
+                            "repo so nothing merges broken. Please take a "
+                            "look at the PR, then comment here and add the "
+                            "`answered` label to resume.")
+                        if b:
+                            state["seen_blockers"].append(b)
+                            notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                          f"#{b} CI keeps failing on PR #{p['number']}\n\n"
+                                          "The loop could not fix it automatically. "
+                                          "Comment on the issue and add the "
+                                          "`answered` label (or reply here) "
+                                          "to resume.",
+                                          priority="high", tags="warning",
+                                          url=p.get("url"))
+                waiting = True
+                continue
+            if state_ != "green":
+                log(f"PR #{p['number']} approved but checks pending; waiting")
                 waiting = True
                 continue
             log(f"PR #{p['number']} approved + green: merge")
@@ -672,6 +836,14 @@ def tick(dry):
                               "Documents/04_projects/ within ~5 min. "
                               "No action needed.",
                               tags="white_check_mark", url=p.get("url"))
+                # Delivery complete for this PR: verify scope + storage.
+                if p["number"] not in state["verified_merges"]:
+                    state["verified_merges"].append(p["number"])
+                    state["verified_idle"] = False
+                    maybe_save(state, dry)
+                    verify_delivery(
+                        f"PR #{p['number']} ({p['title']}) just merged to main",
+                        dry)
             else:
                 waiting = True
                 if p["number"] not in state["merge_failed_prs"]:
@@ -824,6 +996,14 @@ def tick(dry):
                           "is idle. No action needed — file new work via a "
                           "`task` issue or /task on Telegram.",
                           priority="high", tags="tada")
+    # Delivery considered complete for the whole repo: verify once per
+    # idle period (the flag is cleared whenever new work arrives).
+    if not state.get("verified_idle"):
+        state["verified_idle"] = True
+        maybe_save(state, dry)
+        verify_delivery(
+            "the roadmap is complete, all PRs are merged, and the repo is idle",
+            dry)
     maybe_save(state, dry)
     return "idle"
 
