@@ -20,6 +20,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import gemini_apply
+import gemini_audit
 import gemini_candidates
 
 # Import functions from geotag.py
@@ -1794,6 +1795,60 @@ class TestMergeIntoState(unittest.TestCase):
             state, merged = gemini_apply.merge_into_state(self._state(), cand)
             self.assertEqual(merged, 0)
             self.assertEqual(state[0]["status"], "not_found")
+
+
+# ---------------------------------------------------------------------------
+# gemini_audit
+# ---------------------------------------------------------------------------
+
+class TestSampleEvery(unittest.TestCase):
+    def test_every_100th(self):
+        items = list(range(350))
+        out = gemini_audit.sample_every(items, 100)
+        self.assertEqual(out, [0, 100, 200, 300])
+
+    def test_fewer_than_every(self):
+        self.assertEqual(gemini_audit.sample_every([1, 2, 3], 100), [1])
+
+    def test_zero_and_negative(self):
+        self.assertEqual(gemini_audit.sample_every([1, 2, 3], 0), [])
+        self.assertEqual(gemini_audit.sample_every([1, 2, 3], -1), [])
+
+
+class TestVerdictFor(unittest.TestCase):
+    def test_match(self):
+        self.assertEqual(gemini_audit.verdict_for(0.5), "match")
+        self.assertEqual(gemini_audit.verdict_for(25.0), "match")
+
+    def test_check(self):
+        self.assertEqual(gemini_audit.verdict_for(25.1), "check")
+        self.assertEqual(gemini_audit.verdict_for(100.0), "check")
+
+    def test_mismatch(self):
+        self.assertEqual(gemini_audit.verdict_for(100.1), "mismatch")
+        self.assertEqual(gemini_audit.verdict_for(8000.0), "mismatch")
+
+    def test_none_is_no_geocode(self):
+        self.assertEqual(gemini_audit.verdict_for(None), "no_geocode")
+
+
+class TestAuditWorkflow(unittest.TestCase):
+    """located_images: paginate, keep only photos that carry GPS."""
+
+    def test_located_images_filters_and_paginates(self):
+        immich = gemini_audit.geotag.Immich("https://immich.example.com", "k")
+        p1 = {"assets": {"items": [
+            {"id": "a1", "exifInfo": {"latitude": 1.0, "longitude": 2.0}},
+            {"id": "a2", "exifInfo": {"latitude": None, "longitude": None}},
+            {"id": "a3", "exifInfo": {}},
+        ], "nextPage": 2}}
+        p2 = {"assets": {"items": [
+            {"id": "a4", "exifInfo": {"latitude": 3.0, "longitude": 4.0}},
+        ], "nextPage": None}}
+        with mock.patch.object(gemini_audit, "http_json") as mock_http:
+            mock_http.side_effect = [p1, p2]
+            out = list(gemini_audit.located_images(immich))
+        self.assertEqual([a["id"] for a in out], ["a1", "a4"])
 
 
 # ---------------------------------------------------------------------------
