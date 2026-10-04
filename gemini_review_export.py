@@ -47,7 +47,8 @@ def split_rows(all_rows):
     located = [r for r in all_rows if r.get("latitude")
                and r["status"] in ("applied", "candidate", "confirmed")]
     flagged = [r for r in all_rows
-               if r["status"] == "flagged" or r.get("flag") == "outlier"]
+               if r["status"] == "flagged"
+               or r.get("flag") in ("outlier", "geo-outlier")]
     ungeocoded = [r for r in all_rows
                   if r["status"] == "no_match" and r.get("place")
                   and float(r.get("confidence") or 0) >= 0.5]

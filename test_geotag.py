@@ -1797,6 +1797,83 @@ class TestMergeIntoState(unittest.TestCase):
             self.assertEqual(state[0]["status"], "not_found")
 
 
+class TestFlagGeoOutliers(unittest.TestCase):
+    """Geography coherence: a candidate far from ALL its temporal
+    neighbors is a wrong-continent geocode, not a location."""
+
+    def _row(self, aid, status, taken_at, lat, lon, place="X", flag=""):
+        return {"asset_id": aid, "status": status, "taken_at": taken_at,
+                "latitude": lat, "longitude": lon, "place": place,
+                "geocoded_name": "", "maps_url": "", "confidence": "",
+                "inferred_from": "", "flag": flag}
+
+    def test_wrong_continent_candidate_flagged(self):
+        # "Golden Triangle Park" geocoded to Ottawa; same-day photos are
+        # all at the real Golden Triangle in Thailand.
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "45.419", "-75.685", "Golden Triangle Park"),
+            self._row("a2", "candidate", "2026-04-08T10:30:00Z",
+                      "20.353", "100.081", "Golden Triangle Viewpoint"),
+            self._row("a3", "candidate", "2026-04-08T11:00:00Z",
+                      "20.353", "100.081", "Golden Triangle Viewpoint"),
+        ]
+        rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
+        self.assertEqual(flagged, 1)
+        self.assertEqual(rows[0]["status"], "flagged")
+        self.assertEqual(rows[0]["flag"], "geo-outlier")
+        self.assertEqual(rows[1]["status"], "candidate")
+
+    def test_coherent_candidate_not_flagged(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "20.353", "100.081", "Golden Triangle Park"),
+            self._row("a2", "candidate", "2026-04-08T10:30:00Z",
+                      "20.340", "100.105", "Golden Triangle Viewpoint"),
+        ]
+        rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
+        self.assertEqual(flagged, 0)
+
+    def test_no_neighbors_left_alone(self):
+        # Lonely photos are the isolation flagger's job, not this one's.
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "45.419", "-75.685"),
+            self._row("a2", "candidate", "2026-04-20T10:00:00Z",
+                      "20.353", "100.081"),
+        ]
+        rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
+        self.assertEqual(flagged, 0)
+
+    def test_reviewed_rows_exempt(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "45.419", "-75.685", flag="reviewed"),
+            self._row("a2", "candidate", "2026-04-08T10:30:00Z",
+                      "20.353", "100.081"),
+        ]
+        rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
+        # a1 is exempt; a2 contradicts its only neighbor and is flagged
+        self.assertEqual(rows[0]["status"], "candidate")
+        self.assertEqual(rows[0]["flag"], "reviewed")
+        self.assertEqual(rows[1]["status"], "flagged")
+
+    def test_applied_keeps_status_but_flagged(self):
+        rows = [
+            self._row("a1", "applied", "2026-04-08T10:00:00Z",
+                      "45.419", "-75.685"),
+            self._row("a2", "candidate", "2026-04-08T10:30:00Z",
+                      "20.353", "100.081"),
+        ]
+        rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
+        # both contradict each other: applied keeps its status, candidate
+        # is held back for review
+        self.assertEqual(flagged, 2)
+        self.assertEqual(rows[0]["status"], "applied")
+        self.assertEqual(rows[0]["flag"], "geo-outlier")
+        self.assertEqual(rows[1]["status"], "flagged")
+
+
 # ---------------------------------------------------------------------------
 # gemini_audit
 # ---------------------------------------------------------------------------
