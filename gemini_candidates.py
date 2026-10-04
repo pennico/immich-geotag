@@ -229,6 +229,10 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="max images this run")
     parser.add_argument("--model", default="gemini-3.8-flash")
     parser.add_argument("--min-confidence", type=float, default=0.5)
+    parser.add_argument("--retries", type=int, default=3,
+                        help="Gemini 5xx retries per batch (default 3)")
+    parser.add_argument("--backoff", type=int, default=20,
+                        help="seconds between Gemini retries (default 20)")
     args = parser.parse_args()
 
     load_env()
@@ -300,7 +304,8 @@ def main():
         if not kept:
             continue
         try:
-            results = gemini_identify(previews, api_key, args.model)
+            results = gemini_identify(previews, api_key, args.model,
+                                      retries=args.retries, backoff=args.backoff)
         except ApiError as e:
             msg = str(e)
             if "HTTP 429" in msg:
