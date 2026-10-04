@@ -1709,8 +1709,8 @@ class TestFlagOutliers(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "candidate")
 
     def test_big_group_not_flagged(self):
-        rows = [self._row("a{}".format(i), "candidate",
-                          "2026-04-08T10:0{}:00Z".format(i), place="Chichen")
+        rows = [self._row(f"a{i}", "candidate",
+                          f"2026-04-08T10:0{i}:00Z", place="Chichen")
                 for i in range(1, 4)]
         rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
         self.assertEqual(flagged, 0)

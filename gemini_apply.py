@@ -44,9 +44,9 @@ sys.path.insert(0, SCRIPT_DIR)
 import geotag  # noqa: E402
 from gemini_candidates import (  # noqa: E402
     CANDIDATE_COLUMNS,
+    geo_allowed,
     geocode_place,
     parse_bbox,
-    geo_allowed,
 )
 
 STATE_PATH = os.path.join(SCRIPT_DIR, "geotag-data", "state.csv")
@@ -185,7 +185,7 @@ def recover_and_confirm(rows, email, min_confidence, floor, hours, km, validator
         row["latitude"] = str(lat)
         row["longitude"] = str(lon)
         row["geocoded_name"] = name
-        row["maps_url"] = "https://www.google.com/maps?q={:.5f},{:.5f}".format(lat, lon)
+        row["maps_url"] = f"https://www.google.com/maps?q={lat:.5f},{lon:.5f}"
         row["inferred_from"] = ""
         if conf >= min_confidence:
             row["status"] = "candidate"
@@ -385,13 +385,13 @@ def main():
     airport_bboxes = [b for b in (parse_bbox(x) for x in args.airport_bbox) if b]
     validator = None
     if allow_bboxes or airport_bboxes:
-        def validator(lat, lon, name):  # noqa: F811
+        def validator(lat, lon, name):
             return geo_allowed(lat, lon, "", name, allow_bboxes, airport_bboxes)
 
     cand_rows = geotag.read_csv(args.candidates)
     state_rows = geotag.read_csv(args.state)
     if not cand_rows:
-        sys.exit("No rows in {}".format(args.candidates))
+        sys.exit(f"No rows in {args.candidates}")
 
     # 1. Enrich: persistent timestamp cache
     cache = load_times_cache(args.times_cache)
@@ -399,8 +399,7 @@ def main():
     needed += [r["asset_id"] for r in state_rows
                if r.get("status") == "applied" and r["asset_id"] not in cache]
     if needed:
-        print("fetching {} photo timestamps from Immich...".format(
-            len(set(needed))))
+        print(f"fetching {len(set(needed))} photo timestamps from Immich...")
         times = fetch_taken_at(immich, [a for a in dict.fromkeys(needed)], cache)
         for row in cand_rows:
             if not row.get("taken_at"):
@@ -414,17 +413,15 @@ def main():
     cand_rows, recovered, confirmed = recover_and_confirm(
         cand_rows, email, args.min_confidence, args.floor,
         args.hours, args.km, validator)
-    print("recovered {} high-confidence proposals, confirmed {} uncertain ones".format(
-        recovered, confirmed))
+    print(f"recovered {recovered} high-confidence proposals, confirmed {confirmed} uncertain ones")
 
     # 4. Flag outliers
     cand_rows, flagged = flag_outliers(
         cand_rows, args.max_group, args.isolation_hours)
-    print("flagged {} photos in small isolated groups for review".format(flagged))
+    print(f"flagged {flagged} photos in small isolated groups for review")
     cand_rows, geo_flagged = flag_geo_outliers(
         cand_rows, args.geo_hours, args.geo_km)
-    print("flagged {} photos contradicting their temporal neighbors".format(
-        geo_flagged))
+    print(f"flagged {geo_flagged} photos contradicting their temporal neighbors")
 
     # 5. Persist candidates CSV, merge into state, apply via geotag.py
     geotag.write_csv(args.candidates, cand_rows, CANDIDATE_COLUMNS)
@@ -432,7 +429,7 @@ def main():
     geotag.write_csv(args.state, state_rows)
 
     n_ready = sum(1 for r in cand_rows if r.get("status") in ("candidate", "confirmed"))
-    print("ready to apply: {} rows ({} merged into state.csv)".format(n_ready, merged))
+    print(f"ready to apply: {n_ready} rows ({merged} merged into state.csv)")
 
     apply_args = argparse.Namespace(csv=args.state, dry_run=args.dry_run)
     geotag.cmd_apply(apply_args)
