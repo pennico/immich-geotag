@@ -17,7 +17,10 @@ ever re-run:
      means the geotag stays blank.
   4. Flag: small groups (<= --max-group photos of one place) that are
      temporally isolated from all other located photos are flagged for
-     owner review instead of applied.
+     owner review instead of applied. Candidates that sit farther than
+     --geo-km from ALL located photos taken within +-hours are flagged
+     too (geography coherence: a generic place name can geocode to a
+     same-named place on another continent).
   5. Apply: merge candidate/confirmed rows into state.csv and run
      geotag.py's apply subcommand - the only code path that writes to
      Immich (idempotent, crash-safe, --dry-run supported).
@@ -254,6 +257,55 @@ def flag_outliers(rows, max_group=2, isolation_hours=12):
 
 
 # ---------------------------------------------------------------------------
+# Geography-coherence outliers
+# ---------------------------------------------------------------------------
+
+def flag_geo_outliers(rows, hours=12, km=100):
+    """Flag located rows whose coordinates contradict every located photo
+    taken within +-hours (the owner's outlier rule, generalized to
+    distance instead of place names).
+
+    Outside a known trip region there is no geography bound, and a
+    generic place name can geocode to a same-named place on another
+    continent ("Golden Triangle Park" -> Ottawa instead of Thailand).
+    A candidate that sits more than km from ALL its temporal neighbors
+    is flagged for owner review instead of applied. Rows with no located
+    neighbors within the window are left alone - the place-name
+    isolation flagger covers lonely photos. Owner-reviewed rows
+    (flag=reviewed) are never flagged.
+    """
+    located = [r for r in rows
+               if r.get("latitude") and r.get("status") in
+               ("candidate", "confirmed", "applied")]
+    times = {}
+    for r in located:
+        t = parse_time(r.get("taken_at"))
+        if t is not None:
+            times[id(r)] = t
+
+    flagged = 0
+    for r in located:
+        if r.get("flag") == "reviewed":
+            continue
+        t = times.get(id(r))
+        if t is None:
+            continue
+        neighbors = [o for o in located
+                     if o is not r and id(o) in times
+                     and abs((times[id(o)] - t).total_seconds()) <= hours * 3600]
+        if not neighbors:
+            continue
+        lat, lon = float(r["latitude"]), float(r["longitude"])
+        if all(haversine_km(lat, lon, float(o["latitude"]),
+                            float(o["longitude"])) > km for o in neighbors):
+            r["flag"] = "geo-outlier"
+            if r["status"] in ("candidate", "confirmed"):
+                r["status"] = "flagged"
+            flagged += 1
+    return rows, flagged
+
+
+# ---------------------------------------------------------------------------
 # State ledger merge
 # ---------------------------------------------------------------------------
 
@@ -306,6 +358,11 @@ def main():
                         help="place groups this small may be outliers (default 2)")
     parser.add_argument("--isolation-hours", type=float, default=12.0,
                         help="hours of solitude before a small group is flagged (default 12)")
+    parser.add_argument("--geo-hours", type=float, default=12.0,
+                        help="temporal window for geography coherence (default 12)")
+    parser.add_argument("--geo-km", type=float, default=100.0,
+                        help="a candidate farther than this from ALL its "
+                             "temporal neighbors is flagged (default 100)")
     parser.add_argument("--allow-bbox", action="append", default=[],
                         metavar="LAT_MIN,LON_MIN,LAT_MAX,LON_MAX",
                         help="allowed trip region; geocodes outside are disregarded")
@@ -364,6 +421,10 @@ def main():
     cand_rows, flagged = flag_outliers(
         cand_rows, args.max_group, args.isolation_hours)
     print("flagged {} photos in small isolated groups for review".format(flagged))
+    cand_rows, geo_flagged = flag_geo_outliers(
+        cand_rows, args.geo_hours, args.geo_km)
+    print("flagged {} photos contradicting their temporal neighbors".format(
+        geo_flagged))
 
     # 5. Persist candidates CSV, merge into state, apply via geotag.py
     geotag.write_csv(args.candidates, cand_rows, CANDIDATE_COLUMNS)
