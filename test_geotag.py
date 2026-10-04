@@ -1425,6 +1425,19 @@ class TestGeocodePlace(unittest.TestCase):
                     gemini_candidates.geocode_place("Nowhere", "X", "Y", None))
 
 
+class TestToDatetime(unittest.TestCase):
+    def test_bare_date_gets_time(self):
+        self.assertEqual(gemini_candidates._to_datetime("2026-03-01"),
+                         "2026-03-01T00:00:00.000Z")
+
+    def test_datetime_unchanged(self):
+        self.assertEqual(gemini_candidates._to_datetime("2026-03-01T10:00:00.000Z"),
+                         "2026-03-01T10:00:00.000Z")
+
+    def test_none_unchanged(self):
+        self.assertIsNone(gemini_candidates._to_datetime(None))
+
+
 class TestWindowAssets(unittest.TestCase):
     """window_assets: filter by type, missing geo, and not_found membership."""
 
