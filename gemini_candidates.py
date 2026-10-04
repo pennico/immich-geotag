@@ -144,10 +144,22 @@ def parse_gemini_json(text, n):
 # Asset selection
 # ---------------------------------------------------------------------------
 
+def _to_datetime(value):
+    """Normalize a date or datetime string to Immich's expected format.
+
+    Immich's search validation rejects bare dates ("2026-03-01"); it wants
+    a full datetime. Dates are interpreted as UTC midnight.
+    """
+    if value and "T" not in value:
+        return value + "T00:00:00.000Z"
+    return value
+
+
 def window_assets(immich, after, before, not_found_ids):
     """Yield missing-GEO IMAGE assets in the [after, before) photo-date window
     whose asset_id is in not_found_ids."""
     page = 1
+    after, before = _to_datetime(after), _to_datetime(before)
     while True:
         payload = {"page": page, "size": 250, "withExif": True, "type": "IMAGE"}
         if after:
