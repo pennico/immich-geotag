@@ -1394,16 +1394,34 @@ class TestParseGeminiJson(unittest.TestCase):
         self.assertIsNone(results[0]["place"])
 
 
-class TestGeocodeQuery(unittest.TestCase):
-    def test_all_parts(self):
-        self.assertEqual(
-            gemini_candidates.geocode_query("Chichen Itza", "Tinum", "Mexico"),
-            "Chichen Itza, Tinum, Mexico")
+class TestGeocodePlace(unittest.TestCase):
+    """geocode_place: fall back to simpler queries when the full one fails."""
 
-    def test_place_only(self):
-        self.assertEqual(
-            gemini_candidates.geocode_query("Chichen Itza", None, None),
-            "Chichen Itza")
+    def test_full_query_hits_first(self):
+        with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
+            mock_geo.return_value = (1.0, 2.0, "Somewhere")
+            out = gemini_candidates.geocode_place("Chichen Itza", "Tinum", "Mexico", None)
+        self.assertEqual(out, (1.0, 2.0, "Somewhere"))
+        self.assertEqual(mock_geo.call_count, 1)
+        mock_geo.assert_called_with("Chichen Itza, Tinum, Mexico", None)
+
+    def test_falls_back_to_place_only(self):
+        # Full and place+country queries fail; bare place resolves.
+        with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
+            mock_geo.side_effect = [None, None, (20.68, -88.56, "Chichen Itza")]
+            with mock.patch.object(gemini_candidates.time, "sleep"):
+                out = gemini_candidates.geocode_place(
+                    "El Castillo, Chichen Itza", "Tinum", "Mexico", None)
+        self.assertEqual(out, (20.68, -88.56, "Chichen Itza"))
+        self.assertEqual(mock_geo.call_count, 3)
+        self.assertEqual(mock_geo.call_args_list[2][0][0], "El Castillo, Chichen Itza")
+
+    def test_all_fail_returns_none(self):
+        with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
+            mock_geo.return_value = None
+            with mock.patch.object(gemini_candidates.time, "sleep"):
+                self.assertIsNone(
+                    gemini_candidates.geocode_place("Nowhere", "X", "Y", None))
 
 
 class TestWindowAssets(unittest.TestCase):
