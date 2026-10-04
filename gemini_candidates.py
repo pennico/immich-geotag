@@ -47,7 +47,7 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generat
 CANDIDATE_COLUMNS = [
     "asset_id", "file_name", "place", "city", "country", "confidence",
     "latitude", "longitude", "geocoded_name", "maps_url", "immich_url",
-    "status", "run_date", "taken_at", "inferred_from",
+    "status", "run_date", "taken_at", "inferred_from", "flag",
 ]
 
 PROMPT_TEMPLATE = (

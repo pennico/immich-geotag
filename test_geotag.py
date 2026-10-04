@@ -1726,6 +1726,10 @@ class TestFlagOutliers(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "applied")
         self.assertEqual(rows[0]["flag"], "outlier")
 
+    def test_flag_column_persisted(self):
+        # flag_outliers sets row["flag"]; the CSV schema must carry it
+        self.assertIn("flag", gemini_candidates.CANDIDATE_COLUMNS)
+
 
 class TestMergeIntoState(unittest.TestCase):
     def _state(self, status="not_found"):
