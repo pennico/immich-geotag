@@ -8,6 +8,7 @@ duplicate asset_id guard.
 Run: python3 test_geotag.py
 """
 
+import json
 import os
 import shutil
 import sys
@@ -17,6 +18,8 @@ from unittest import mock
 
 # Add the repo root to path so we can import geotag
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import gemini_candidates
 
 # Import functions from geotag.py
 from geotag import (
@@ -1338,6 +1341,97 @@ class TestResumeSkip(unittest.TestCase):
 
         # preview_jpeg should only be called for a2
         self.assertEqual(mock_immich.preview_jpeg.call_count, 1)
+
+
+# ---------------------------------------------------------------------------
+# gemini_candidates
+# ---------------------------------------------------------------------------
+
+class TestParseGeminiJson(unittest.TestCase):
+    """parse_gemini_json: normalize Gemini's JSON answer, never crash."""
+
+    def test_valid_full_answer(self):
+        text = json.dumps([
+            {"index": 1, "place": "Chichen Itza", "city": "Tinum",
+             "country": "Mexico", "confidence": 0.9},
+            {"index": 2, "place": None, "confidence": 0},
+        ])
+        results = gemini_candidates.parse_gemini_json(text, 2)
+        self.assertEqual(results[0]["place"], "Chichen Itza")
+        self.assertEqual(results[0]["confidence"], 0.9)
+        self.assertIsNone(results[1]["place"])
+
+    def test_missing_entry_becomes_null(self):
+        # Gemini returned only 1 object for 3 images
+        text = json.dumps([{"index": 2, "place": "Colosseum", "confidence": 0.8}])
+        results = gemini_candidates.parse_gemini_json(text, 3)
+        self.assertIsNone(results[0]["place"])
+        self.assertEqual(results[1]["place"], "Colosseum")
+        self.assertIsNone(results[2]["place"])
+
+    def test_malformed_json_all_null(self):
+        results = gemini_candidates.parse_gemini_json("not json at all", 2)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["place"] is None for r in results))
+
+    def test_non_list_answer_all_null(self):
+        results = gemini_candidates.parse_gemini_json('{"error": "x"}', 2)
+        self.assertTrue(all(r["place"] is None for r in results))
+
+    def test_out_of_range_index_ignored(self):
+        text = json.dumps([{"index": 7, "place": "Nowhere", "confidence": 1.0}])
+        results = gemini_candidates.parse_gemini_json(text, 2)
+        self.assertTrue(all(r["place"] is None for r in results))
+
+    def test_confidence_clamped(self):
+        text = json.dumps([{"index": 1, "place": "X", "confidence": 5}])
+        results = gemini_candidates.parse_gemini_json(text, 1)
+        self.assertEqual(results[0]["confidence"], 1.0)
+
+    def test_empty_place_string_is_null(self):
+        text = json.dumps([{"index": 1, "place": "  ", "confidence": 0.9}])
+        results = gemini_candidates.parse_gemini_json(text, 1)
+        self.assertIsNone(results[0]["place"])
+
+
+class TestGeocodeQuery(unittest.TestCase):
+    def test_all_parts(self):
+        self.assertEqual(
+            gemini_candidates.geocode_query("Chichen Itza", "Tinum", "Mexico"),
+            "Chichen Itza, Tinum, Mexico")
+
+    def test_place_only(self):
+        self.assertEqual(
+            gemini_candidates.geocode_query("Chichen Itza", None, None),
+            "Chichen Itza")
+
+
+class TestWindowAssets(unittest.TestCase):
+    """window_assets: filter by type, missing geo, and not_found membership."""
+
+    def _run(self, pages, not_found_ids):
+        immich = gemini_candidates.Immich("https://immich.example.com", "k")
+        with mock.patch.object(gemini_candidates, "http_json") as mock_http:
+            mock_http.side_effect = pages
+            return list(gemini_candidates.window_assets(
+                immich, "2026-03-01", "2026-05-01", not_found_ids))
+
+    def test_filters(self):
+        page = {"assets": {"items": [
+            {"id": "a1", "type": "IMAGE", "exifInfo": {"latitude": None, "longitude": None}},
+            {"id": "a2", "type": "VIDEO", "exifInfo": {"latitude": None, "longitude": None}},
+            {"id": "a3", "type": "IMAGE", "exifInfo": {"latitude": 1.0, "longitude": 2.0}},
+            {"id": "a4", "type": "IMAGE", "exifInfo": {"latitude": None, "longitude": None}},
+        ], "nextPage": None}}
+        out = self._run([page], {"a1", "a4", "a9"})
+        self.assertEqual([a["id"] for a in out], ["a1", "a4"])
+
+    def test_pagination_stops(self):
+        p1 = {"assets": {"items": [
+            {"id": "a1", "type": "IMAGE", "exifInfo": {}}], "nextPage": 2}}
+        p2 = {"assets": {"items": [], "nextPage": None}}
+        out = self._run([p1, p2], {"a1"})
+        self.assertEqual(len(out), 1)
 
 
 # ---------------------------------------------------------------------------
