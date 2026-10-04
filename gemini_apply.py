@@ -205,7 +205,8 @@ def flag_outliers(rows, max_group=2, isolation_hours=12):
     place is an outlier when no located photo OUTSIDE the group was taken
     within +-isolation_hours of it. Flagged rows are not applied; already
     applied ones keep their status but carry flag=outlier for the review
-    page.
+    page. Rows the owner already reviewed (flag=reviewed) are never
+    re-flagged.
     """
     located = [r for r in rows
                if r.get("latitude") and r.get("status") in
@@ -218,6 +219,8 @@ def flag_outliers(rows, max_group=2, isolation_hours=12):
 
     groups = {}
     for r in located:
+        if r.get("flag") == "reviewed":
+            continue  # owner already approved - never re-flag
         groups.setdefault(r.get("place", ""), []).append(r)
 
     flagged = 0
