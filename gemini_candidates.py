@@ -182,18 +182,56 @@ def window_assets(immich, after, before, not_found_ids):
         page += 1
 
 
-def geocode_place(place, city, country, email):
+def parse_bbox(value):
+    """Parse 'lat_min,lon_min,lat_max,lon_max' into a tuple, or None."""
+    try:
+        parts = [float(x) for x in value.split(",")]
+        if len(parts) != 4:
+            return None
+        return tuple(parts)
+    except ValueError:
+        return None
+
+
+def in_bbox(lat, lon, bbox):
+    lat_min, lon_min, lat_max, lon_max = bbox
+    return lat_min <= lat <= lat_max and lon_min <= lon <= lon_max
+
+
+def geo_allowed(lat, lon, place, geocoded_name, allow_bboxes=(), airport_bboxes=()):
+    """Owner's trip-geography rule.
+
+    A location is allowed inside one of the --allow-bbox regions (e.g.
+    Mexico), or - when the identified place is an airport - inside one of
+    the --airport-bbox regions (e.g. US / London, for travel days).
+    Anything else is a misidentification or a bad geocode and must be
+    disregarded.
+    """
+    if any(in_bbox(lat, lon, b) for b in allow_bboxes):
+        return True
+    if airport_bboxes and "airport" in (place + " " + (geocoded_name or "")).lower():
+        return any(in_bbox(lat, lon, b) for b in airport_bboxes)
+    return False
+
+
+def geocode_place(place, city, country, email, validate=None):
     """Geocode an identified place via Nominatim, trying simpler queries first.
 
     Nominatim treats commas as address components, so a full
     "landmark, city, country" query often fails while parts of it resolve.
     Try progressively simpler forms; first hit wins. When the place name
     itself is comma-separated ("El Castillo, Chichen Itza"), try its
-    segments in reverse order — the trailing parent site is usually the
+    segments in reverse order - the trailing parent site is usually the
     landmark Nominatim knows.
+
+    When `validate` (lat, lon, geocoded_name -> bool) is provided, hits
+    that fail it are skipped and the next query variant is tried - this
+    stops a generic landmark name from resolving to a same-named place
+    on another continent.
     """
     queries = []
     for candidate in (", ".join(p for p in (place, city, country) if p),
+                      ", ".join(p for p in (place, city) if p),
                       ", ".join(p for p in (place, country) if p),
                       place):
         if candidate and candidate not in queries:
@@ -206,7 +244,9 @@ def geocode_place(place, city, country, email):
     for query in queries:
         hit = nominatim_search(query, email)
         if hit:
-            return hit
+            if validate is None or validate(hit[0], hit[1], hit[2]):
+                return hit
+            # Resolved to a disallowed place (wrong country) - keep trying.
         time.sleep(1)  # Nominatim usage policy: max 1 req/sec
     return None
 
@@ -233,7 +273,22 @@ def main():
                         help="Gemini 5xx retries per batch (default 3)")
     parser.add_argument("--backoff", type=int, default=20,
                         help="seconds between Gemini retries (default 20)")
+    parser.add_argument("--allow-bbox", action="append", default=[],
+                        metavar="LAT_MIN,LON_MIN,LAT_MAX,LON_MAX",
+                        help="allowed trip region; geocodes outside are retried/"
+                             "disregarded (repeatable)")
+    parser.add_argument("--airport-bbox", action="append", default=[],
+                        metavar="LAT_MIN,LON_MIN,LAT_MAX,LON_MAX",
+                        help="extra allowed region for airport-named places, "
+                             "e.g. US/UK for travel days (repeatable)")
     args = parser.parse_args()
+
+    allow_bboxes = [b for b in (parse_bbox(x) for x in args.allow_bbox) if b]
+    airport_bboxes = [b for b in (parse_bbox(x) for x in args.airport_bbox) if b]
+    validator = None
+    if allow_bboxes or airport_bboxes:
+        validator = lambda lat, lon, name: geo_allowed(  # noqa: E731
+            lat, lon, "", name, allow_bboxes, airport_bboxes)
 
     load_env()
     api_key = os.environ.get("GEMINI_API_KEY", "")
@@ -333,7 +388,8 @@ def main():
                 cache_key = (res["place"], res["city"], res["country"])
                 if cache_key not in geocode_cache:
                     geocode_cache[cache_key] = geocode_place(
-                        res["place"], res["city"], res["country"], email)
+                        res["place"], res["city"], res["country"], email,
+                        validate=validator)
                 geo = geocode_cache[cache_key]
                 if geo:
                     lat, lon, name = geo

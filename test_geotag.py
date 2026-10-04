@@ -1408,15 +1408,18 @@ class TestGeocodePlace(unittest.TestCase):
 
     def test_falls_back_through_comma_segments(self):
         # Full queries and the comma-containing place fail; the trailing
-        # parent site segment resolves.
+        # parent site segment resolves. Query order: (place,city,country),
+        # (place,city), (place,country), place, then reversed place
+        # segments - "Chichen Itza" is the 5th.
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
-            mock_geo.side_effect = [None, None, None, (20.68, -88.56, "Chichen Itza")]
+            mock_geo.side_effect = [None, None, None, None,
+                                    (20.68, -88.56, "Chichen Itza")]
             with mock.patch.object(gemini_candidates.time, "sleep"):
                 out = gemini_candidates.geocode_place(
                     "El Castillo, Chichen Itza", "Tinum", "Mexico", None)
         self.assertEqual(out, (20.68, -88.56, "Chichen Itza"))
-        self.assertEqual(mock_geo.call_count, 4)
-        self.assertEqual(mock_geo.call_args_list[3][0][0], "Chichen Itza")
+        self.assertEqual(mock_geo.call_count, 5)
+        self.assertEqual(mock_geo.call_args_list[4][0][0], "Chichen Itza")
 
     def test_all_fail_returns_none(self):
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
@@ -1424,6 +1427,33 @@ class TestGeocodePlace(unittest.TestCase):
             with mock.patch.object(gemini_candidates.time, "sleep"):
                 self.assertIsNone(
                     gemini_candidates.geocode_place("Nowhere", "X", "Y", None))
+
+    def test_validator_rejects_wrong_continent_and_tries_next(self):
+        # First hit resolves to Dominican Republic; the validator (Mexico
+        # trip bbox) rejects it and the next query variant finds Mexico.
+        # Latitude alone cannot tell them apart - the longitude can.
+        mexico = lambda lat, lon, name: (  # noqa: E731
+            14.5 < lat < 33.0 and -118.0 < lon < -86.0)
+        calls = [(18.48, -69.93, "Santo Domingo, Dominican Republic"),
+                 (17.06, -96.72, "Oaxaca, Mexico")]
+        with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
+            mock_geo.side_effect = calls
+            with mock.patch.object(gemini_candidates.time, "sleep"):
+                out = gemini_candidates.geocode_place(
+                    "Church of Santo Domingo de Guzman", "Oaxaca", "Mexico",
+                    None, validate=mexico)
+        self.assertEqual(out, (17.06, -96.72, "Oaxaca, Mexico"))
+        self.assertEqual(mock_geo.call_count, 2)
+
+    def test_validator_accepts_first_hit(self):
+        mexico = lambda lat, lon, name: (  # noqa: E731
+            14.5 < lat < 33.0 and -118.0 < lon < -86.0)
+        with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
+            mock_geo.return_value = (20.68, -88.57, "Chichen Itza, Mexico")
+            out = gemini_candidates.geocode_place(
+                "Chichen Itza", "Tinum", "Mexico", None, validate=mexico)
+        self.assertEqual(out, (20.68, -88.57, "Chichen Itza, Mexico"))
+        self.assertEqual(mock_geo.call_count, 1)
 
 
 class TestToDatetime(unittest.TestCase):
@@ -1493,104 +1523,232 @@ class TestHaversineAndTime(unittest.TestCase):
         self.assertIsNone(gemini_apply.parse_time(""))
 
 
-class TestInferLocations(unittest.TestCase):
-    """Temporal-coherence inference: the owner's rule."""
+class TestParseBbox(unittest.TestCase):
+    def test_valid(self):
+        self.assertEqual(gemini_candidates.parse_bbox("14.5,-118.0,33.0,-86.0"),
+                         (14.5, -118.0, 33.0, -86.0))
 
-    def _row(self, aid, status, taken_at, lat="", lon="", place=""):
+    def test_wrong_arity(self):
+        self.assertIsNone(gemini_candidates.parse_bbox("1,2,3"))
+
+    def test_garbage(self):
+        self.assertIsNone(gemini_candidates.parse_bbox("a,b,c,d"))
+
+    def test_in_bbox(self):
+        bbox = (14.5, -118.0, 33.0, -86.0)
+        self.assertTrue(gemini_candidates.in_bbox(20.68, -88.57, bbox))
+        self.assertFalse(gemini_candidates.in_bbox(48.85, 2.29, bbox))
+
+
+class TestGeoAllowed(unittest.TestCase):
+    """Owner's trip-geography rule: Mexico + airports in US/London."""
+
+    MEXICO = (14.5, -118.0, 33.0, -86.0)
+    US = (24.0, -125.0, 50.0, -66.0)
+
+    def test_inside_allow_bbox(self):
+        self.assertTrue(gemini_candidates.geo_allowed(
+            20.68, -88.57, "Chichen Itza", "Chichen Itza, Yucatan, Mexico",
+            [self.MEXICO]))
+
+    def test_outside_all_disallowed(self):
+        # Santo Domingo, Dominican Republic - the exact failure we hit
+        self.assertFalse(gemini_candidates.geo_allowed(
+            18.48, -69.93, "Church of Santo Domingo de Guzman",
+            "Santo Domingo, Dominican Republic", [self.MEXICO]))
+
+    def test_airport_inside_airport_bbox(self):
+        self.assertTrue(gemini_candidates.geo_allowed(
+            33.94, -118.40, "LAX Airport", "Los Angeles International Airport",
+            [self.MEXICO], [self.US]))
+
+    def test_non_airport_outside_allow_bbox_rejected(self):
+        # "airport" not in the name -> airport bboxes do not apply
+        self.assertFalse(gemini_candidates.geo_allowed(
+            33.94, -118.40, "Some Diner", "Diner, Los Angeles",
+            [self.MEXICO], [self.US]))
+
+    def test_airport_outside_airport_bbox_rejected(self):
+        self.assertFalse(gemini_candidates.geo_allowed(
+            -33.94, 18.40, "Cape Town Airport", "Cape Town International Airport",
+            [self.MEXICO], [self.US]))
+
+
+class TestRecoverAndConfirm(unittest.TestCase):
+    """Recover failed geocodes; confirm uncertain proposals via neighbors.
+
+    The photo's OWN proposal is always used - never a neighbor's coords.
+    """
+
+    def _row(self, aid, status, taken_at, lat="", lon="", place="",
+             city="", country="", confidence=""):
         return {"asset_id": aid, "status": status, "taken_at": taken_at,
                 "latitude": lat, "longitude": lon, "place": place,
-                "geocoded_name": "", "maps_url": "", "confidence": "",
-                "inferred_from": ""}
+                "city": city, "country": country, "confidence": confidence,
+                "geocoded_name": "", "maps_url": "", "inferred_from": ""}
 
-    def test_coherent_neighbors_infer(self):
+    def _run(self, rows, **kw):
+        with mock.patch.object(gemini_apply, "geocode_place") as mock_geo:
+            mock_geo.return_value = kw.pop("geo", (20.68, -88.57, "Chichen Itza"))
+            out = gemini_apply.recover_and_confirm(
+                rows, None, kw.pop("min_confidence", 0.5), kw.pop("floor", 0.3),
+                kw.pop("hours", 2), kw.pop("km", 10), None)
+        return out
+
+    def test_high_confidence_recovered_without_coherence(self):
+        # No anchors at all - high confidence still recovers
+        rows = [self._row("a1", "no_match", "2026-04-08T10:00:00Z",
+                          place="Great Ball Court", confidence="0.95")]
+        rows, recovered, confirmed = self._run(rows)
+        self.assertEqual((recovered, confirmed), (1, 0))
+        self.assertEqual(rows[0]["status"], "candidate")
+        self.assertEqual(rows[0]["latitude"], "20.68")
+        self.assertEqual(rows[0]["inferred_from"], "")
+
+    def test_uncertain_confirmed_by_coherent_neighbors(self):
         rows = [
             self._row("a1", "candidate", "2026-04-08T10:00:00Z",
                       "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T10:45:00Z"),
+            self._row("a2", "no_match", "2026-04-08T10:45:00Z",
+                      place="Great Ball Court", confidence="0.4"),
             self._row("a3", "candidate", "2026-04-08T11:30:00Z",
                       "20.682", "-88.569", "Chichen Itza"),
         ]
-        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
-        self.assertEqual(inferred, 1)
-        self.assertEqual(rows[1]["status"], "inferred")
-        self.assertEqual(rows[1]["inferred_from"], "a1")
+        rows, recovered, confirmed = self._run(rows)
+        self.assertEqual((recovered, confirmed), (0, 1))
+        self.assertEqual(rows[1]["status"], "confirmed")
+        # the proposal's own geocode, not the neighbor's coords
         self.assertEqual(rows[1]["latitude"], "20.68")
 
-    def test_scattered_neighbors_no_inference(self):
+    def test_uncertain_scattered_neighbors_not_confirmed(self):
         rows = [
             self._row("a1", "candidate", "2026-04-08T10:00:00Z",
                       "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T10:45:00Z"),
-            # a second anchor 300 km away within the window -> not coherent
+            self._row("a2", "no_match", "2026-04-08T10:45:00Z",
+                      place="Great Ball Court", confidence="0.4"),
+            # second anchor 300 km away within the window -> not coherent
             self._row("a3", "candidate", "2026-04-08T11:30:00Z",
                       "21.16", "-86.85", "Cancun"),
         ]
-        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
-        self.assertEqual(inferred, 0)
+        rows, recovered, confirmed = self._run(rows)
+        self.assertEqual((recovered, confirmed), (0, 0))
         self.assertEqual(rows[1]["status"], "no_match")
 
-    def test_no_neighbors_no_inference(self):
+    def test_uncertain_no_neighbors_not_confirmed(self):
         rows = [
             self._row("a1", "candidate", "2026-04-08T10:00:00Z",
                       "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T18:00:00Z"),  # 8h later
+            self._row("a2", "no_match", "2026-04-08T18:00:00Z",
+                      place="Great Ball Court", confidence="0.4"),
         ]
-        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
-        self.assertEqual(inferred, 0)
+        rows, recovered, confirmed = self._run(rows)
+        self.assertEqual((recovered, confirmed), (0, 0))
 
-    def test_single_anchor_infers(self):
-        rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T11:00:00Z"),
-        ]
-        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
-        self.assertEqual(inferred, 1)
+    def test_below_floor_left_blank(self):
+        rows = [self._row("a1", "no_match", "2026-04-08T10:00:00Z",
+                          place="Maybe a beach", confidence="0.2")]
+        rows, recovered, confirmed = self._run(rows)
+        self.assertEqual((recovered, confirmed), (0, 0))
+        self.assertEqual(rows[0]["status"], "no_match")
 
-    def test_inferred_rows_never_anchor(self):
-        rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T11:00:00Z"),
-            self._row("a3", "no_match", "2026-04-08T12:30:00Z"),  # 1.5h from a2
-        ]
-        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
-        self.assertEqual(inferred, 1)  # only a2, not chained a3
-        self.assertEqual(rows[2]["status"], "no_match")
+    def test_geocode_still_fails_stays_no_match(self):
+        rows = [self._row("a1", "no_match", "2026-04-08T10:00:00Z",
+                          place="Ungeocodable", confidence="0.9")]
+        rows, recovered, confirmed = self._run(rows, geo=None)
+        self.assertEqual((recovered, confirmed), (0, 0))
+        self.assertEqual(rows[0]["status"], "no_match")
+
+    def test_no_proposal_untouched(self):
+        rows = [self._row("a1", "no_match", "2026-04-08T10:00:00Z")]
+        rows, recovered, confirmed = self._run(rows)
+        self.assertEqual((recovered, confirmed), (0, 0))
 
     def test_applied_rows_anchor(self):
         rows = [
             self._row("a1", "applied", "2026-04-08T10:00:00Z",
                       "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T10:30:00Z"),
+            self._row("a2", "no_match", "2026-04-08T10:30:00Z",
+                      place="Great Ball Court", confidence="0.4"),
         ]
-        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
-        self.assertEqual(inferred, 1)
-        self.assertEqual(rows[1]["inferred_from"], "a1")
+        rows, recovered, confirmed = self._run(rows)
+        self.assertEqual((recovered, confirmed), (0, 1))
+
+
+class TestFlagOutliers(unittest.TestCase):
+    """Small isolated place-groups are flagged for review, not applied."""
+
+    def _row(self, aid, status, taken_at, lat="20.68", lon="-88.57", place="X"):
+        return {"asset_id": aid, "status": status, "taken_at": taken_at,
+                "latitude": lat, "longitude": lon, "place": place,
+                "geocoded_name": "", "maps_url": "", "confidence": "",
+                "inferred_from": ""}
+
+    def test_small_isolated_group_flagged(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z", place="Wembley"),
+            # nearest other located photo is days away
+            self._row("a2", "candidate", "2026-04-20T10:00:00Z", place="Chichen"),
+            self._row("a3", "candidate", "2026-04-20T11:00:00Z", place="Chichen"),
+            self._row("a4", "candidate", "2026-04-20T12:00:00Z", place="Chichen"),
+        ]
+        rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
+        self.assertEqual(flagged, 1)
+        self.assertEqual(rows[0]["status"], "flagged")
+        self.assertEqual(rows[0]["flag"], "outlier")
+
+    def test_small_group_with_nearby_photos_not_flagged(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z", place="Wembley"),
+            self._row("a2", "candidate", "2026-04-08T12:00:00Z", place="Chichen"),
+            self._row("a3", "candidate", "2026-04-08T14:00:00Z", place="Chichen"),
+            self._row("a4", "candidate", "2026-04-08T16:00:00Z", place="Chichen"),
+        ]
+        rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
+        self.assertEqual(flagged, 0)
+        self.assertEqual(rows[0]["status"], "candidate")
+
+    def test_big_group_not_flagged(self):
+        rows = [self._row("a{}".format(i), "candidate",
+                          "2026-04-08T10:0{}:00Z".format(i), place="Chichen")
+                for i in range(1, 4)]
+        rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
+        self.assertEqual(flagged, 0)
+
+    def test_applied_keeps_status_but_flagged(self):
+        rows = [
+            self._row("a1", "applied", "2026-04-08T10:00:00Z", place="Wembley"),
+            self._row("a2", "candidate", "2026-04-20T10:00:00Z", place="Chichen"),
+            self._row("a3", "candidate", "2026-04-20T11:00:00Z", place="Chichen"),
+            self._row("a4", "candidate", "2026-04-20T12:00:00Z", place="Chichen"),
+        ]
+        rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
+        self.assertEqual(flagged, 1)
+        self.assertEqual(rows[0]["status"], "applied")
+        self.assertEqual(rows[0]["flag"], "outlier")
 
 
 class TestMergeIntoState(unittest.TestCase):
-    def test_merge_marks_located(self):
-        state = [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
-                  "longitude": "", "place": "", "source": "", "score": "",
-                  "status": "not_found", "maps_url": ""}]
+    def _state(self, status="not_found"):
+        return [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+                 "longitude": "", "place": "", "source": "", "score": "",
+                 "status": status, "maps_url": ""}]
+
+    def test_merge_candidate_marks_located_gemini(self):
         cand = [{"asset_id": "a1", "status": "candidate",
                  "latitude": "20.68", "longitude": "-88.57",
                  "place": "Chichen Itza", "confidence": "0.99"}]
-        state, merged = gemini_apply.merge_into_state(state, cand)
+        state, merged = gemini_apply.merge_into_state(self._state(), cand)
         self.assertEqual(merged, 1)
         self.assertEqual(state[0]["status"], "located")
         self.assertEqual(state[0]["source"], "gemini")
 
-    def test_merge_inferred_source(self):
-        state = [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
-                  "longitude": "", "place": "", "source": "", "score": "",
-                  "status": "not_found", "maps_url": ""}]
-        cand = [{"asset_id": "a1", "status": "inferred",
+    def test_merge_confirmed_marks_located_gemini_confirmed(self):
+        cand = [{"asset_id": "a1", "status": "confirmed",
                  "latitude": "20.68", "longitude": "-88.57",
-                 "place": "Chichen Itza", "confidence": ""}]
-        state, merged = gemini_apply.merge_into_state(state, cand)
-        self.assertEqual(state[0]["source"], "gemini-inferred")
+                 "place": "Great Ball Court", "confidence": "0.4"}]
+        state, merged = gemini_apply.merge_into_state(self._state(), cand)
+        self.assertEqual(merged, 1)
+        self.assertEqual(state[0]["source"], "gemini-confirmed")
 
     def test_merge_never_touches_applied(self):
         state = [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "1.0",
@@ -1603,15 +1761,13 @@ class TestMergeIntoState(unittest.TestCase):
         self.assertEqual(merged, 0)
         self.assertEqual(state[0]["place"], "Old")
 
-    def test_merge_skips_no_match(self):
-        state = [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
-                  "longitude": "", "place": "", "source": "", "score": "",
-                  "status": "not_found", "maps_url": ""}]
-        cand = [{"asset_id": "a1", "status": "no_match",
-                 "latitude": "", "longitude": ""}]
-        state, merged = gemini_apply.merge_into_state(state, cand)
-        self.assertEqual(merged, 0)
-        self.assertEqual(state[0]["status"], "not_found")
+    def test_merge_skips_no_match_and_flagged(self):
+        for status in ("no_match", "flagged"):
+            cand = [{"asset_id": "a1", "status": status,
+                     "latitude": "20.68", "longitude": "-88.57"}]
+            state, merged = gemini_apply.merge_into_state(self._state(), cand)
+            self.assertEqual(merged, 0)
+            self.assertEqual(state[0]["status"], "not_found")
 
 
 # ---------------------------------------------------------------------------
