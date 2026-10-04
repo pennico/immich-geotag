@@ -105,6 +105,33 @@ python3 gemini_apply.py --allow-bbox 14.5,-118.0,33.0,-86.0 \
   --airport-bbox 24.0,-125.0,50.0,-66.0 --airport-bbox 51.0,-0.8,52.0,0.5
 ```
 
+## Owner review export (gemini_review_export.py)
+
+Rebuilds `geotag-data/gemini-review/` from the candidates ledger: preview
+image per photo, the full CSV, and `index.html` with three sections —
+applied (green/blue), flagged outliers (orange), identified-but-
+ungeocoded (grey). Photos the owner approved carry `flag=reviewed` and
+are never re-flagged by later runs.
+
+```bash
+python3 gemini_review_export.py               # full rebuild
+python3 gemini_review_export.py --no-images   # HTML + CSV only
+```
+
+## Location audit (gemini_audit.py)
+
+QA sample of photos that already have a location: every Nth located
+photo (`--sample-every`, default 100) is shown to Gemini, the answer is
+geocoded, and the distance to the existing tag is classified:
+match (≤25 km), check (25–100 km), mismatch (>100 km), no_id,
+no_geocode. Never writes to Immich. Resume-safe. Output:
+`geotag-data/gemini-audit/` (audit.csv + index.html + images/).
+
+```bash
+python3 gemini_audit.py                  # sample every 100th located photo
+python3 gemini_audit.py --limit 8       # small test run
+```
+
 ## Data files
 
 `geotag-data/` (gitignored) holds the run state: `state.csv` (ledger),
