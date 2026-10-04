@@ -47,7 +47,7 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generat
 CANDIDATE_COLUMNS = [
     "asset_id", "file_name", "place", "city", "country", "confidence",
     "latitude", "longitude", "geocoded_name", "maps_url", "immich_url",
-    "status", "run_date",
+    "status", "run_date", "taken_at", "inferred_from",
 ]
 
 PROMPT_TEMPLATE = (
@@ -326,6 +326,8 @@ def main():
                 "maps_url": "",
                 "immich_url": "{}/photos/{}".format(public_url, a["id"]),
                 "status": "no_match", "run_date": time.strftime("%Y-%m-%d"),
+                "taken_at": a.get("fileCreatedAt", ""),
+                "inferred_from": "",
             }
             if res["place"] and res["confidence"] >= args.min_confidence:
                 cache_key = (res["place"], res["city"], res["country"])

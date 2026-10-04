@@ -19,6 +19,7 @@ from unittest import mock
 # Add the repo root to path so we can import geotag
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import gemini_apply
 import gemini_candidates
 
 # Import functions from geotag.py
@@ -1464,6 +1465,153 @@ class TestWindowAssets(unittest.TestCase):
         p2 = {"assets": {"items": [], "nextPage": None}}
         out = self._run([p1, p2], {"a1"})
         self.assertEqual(len(out), 1)
+
+
+# ---------------------------------------------------------------------------
+# gemini_apply
+# ---------------------------------------------------------------------------
+
+class TestHaversineAndTime(unittest.TestCase):
+    def test_haversine_known_distance(self):
+        # Chichen Itza -> Cancun is roughly 185 km
+        d = gemini_apply.haversine_km(20.68, -88.57, 21.16, -86.85)
+        self.assertTrue(150 < d < 220, d)
+
+    def test_haversine_zero(self):
+        self.assertAlmostEqual(gemini_apply.haversine_km(10.0, 20.0, 10.0, 20.0), 0.0)
+
+    def test_parse_time_z_suffix(self):
+        t = gemini_apply.parse_time("2026-04-08T15:17:43.403Z")
+        self.assertIsNotNone(t)
+
+    def test_parse_time_offset(self):
+        t = gemini_apply.parse_time("2026-04-08T15:17:43+00:00")
+        self.assertIsNotNone(t)
+
+    def test_parse_time_garbage(self):
+        self.assertIsNone(gemini_apply.parse_time("not a time"))
+        self.assertIsNone(gemini_apply.parse_time(""))
+
+
+class TestInferLocations(unittest.TestCase):
+    """Temporal-coherence inference: the owner's rule."""
+
+    def _row(self, aid, status, taken_at, lat="", lon="", place=""):
+        return {"asset_id": aid, "status": status, "taken_at": taken_at,
+                "latitude": lat, "longitude": lon, "place": place,
+                "geocoded_name": "", "maps_url": "", "confidence": "",
+                "inferred_from": ""}
+
+    def test_coherent_neighbors_infer(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "20.68", "-88.57", "Chichen Itza"),
+            self._row("a2", "no_match", "2026-04-08T10:45:00Z"),
+            self._row("a3", "candidate", "2026-04-08T11:30:00Z",
+                      "20.682", "-88.569", "Chichen Itza"),
+        ]
+        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
+        self.assertEqual(inferred, 1)
+        self.assertEqual(rows[1]["status"], "inferred")
+        self.assertEqual(rows[1]["inferred_from"], "a1")
+        self.assertEqual(rows[1]["latitude"], "20.68")
+
+    def test_scattered_neighbors_no_inference(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "20.68", "-88.57", "Chichen Itza"),
+            self._row("a2", "no_match", "2026-04-08T10:45:00Z"),
+            # a second anchor 300 km away within the window -> not coherent
+            self._row("a3", "candidate", "2026-04-08T11:30:00Z",
+                      "21.16", "-86.85", "Cancun"),
+        ]
+        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
+        self.assertEqual(inferred, 0)
+        self.assertEqual(rows[1]["status"], "no_match")
+
+    def test_no_neighbors_no_inference(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "20.68", "-88.57", "Chichen Itza"),
+            self._row("a2", "no_match", "2026-04-08T18:00:00Z"),  # 8h later
+        ]
+        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
+        self.assertEqual(inferred, 0)
+
+    def test_single_anchor_infers(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "20.68", "-88.57", "Chichen Itza"),
+            self._row("a2", "no_match", "2026-04-08T11:00:00Z"),
+        ]
+        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
+        self.assertEqual(inferred, 1)
+
+    def test_inferred_rows_never_anchor(self):
+        rows = [
+            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
+                      "20.68", "-88.57", "Chichen Itza"),
+            self._row("a2", "no_match", "2026-04-08T11:00:00Z"),
+            self._row("a3", "no_match", "2026-04-08T12:30:00Z"),  # 1.5h from a2
+        ]
+        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
+        self.assertEqual(inferred, 1)  # only a2, not chained a3
+        self.assertEqual(rows[2]["status"], "no_match")
+
+    def test_applied_rows_anchor(self):
+        rows = [
+            self._row("a1", "applied", "2026-04-08T10:00:00Z",
+                      "20.68", "-88.57", "Chichen Itza"),
+            self._row("a2", "no_match", "2026-04-08T10:30:00Z"),
+        ]
+        rows, inferred = gemini_apply.infer_locations(rows, hours=2, km=10)
+        self.assertEqual(inferred, 1)
+        self.assertEqual(rows[1]["inferred_from"], "a1")
+
+
+class TestMergeIntoState(unittest.TestCase):
+    def test_merge_marks_located(self):
+        state = [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+                  "longitude": "", "place": "", "source": "", "score": "",
+                  "status": "not_found", "maps_url": ""}]
+        cand = [{"asset_id": "a1", "status": "candidate",
+                 "latitude": "20.68", "longitude": "-88.57",
+                 "place": "Chichen Itza", "confidence": "0.99"}]
+        state, merged = gemini_apply.merge_into_state(state, cand)
+        self.assertEqual(merged, 1)
+        self.assertEqual(state[0]["status"], "located")
+        self.assertEqual(state[0]["source"], "gemini")
+
+    def test_merge_inferred_source(self):
+        state = [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+                  "longitude": "", "place": "", "source": "", "score": "",
+                  "status": "not_found", "maps_url": ""}]
+        cand = [{"asset_id": "a1", "status": "inferred",
+                 "latitude": "20.68", "longitude": "-88.57",
+                 "place": "Chichen Itza", "confidence": ""}]
+        state, merged = gemini_apply.merge_into_state(state, cand)
+        self.assertEqual(state[0]["source"], "gemini-inferred")
+
+    def test_merge_never_touches_applied(self):
+        state = [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "1.0",
+                  "longitude": "2.0", "place": "Old", "source": "vision",
+                  "score": "0.9", "status": "applied", "maps_url": ""}]
+        cand = [{"asset_id": "a1", "status": "candidate",
+                 "latitude": "20.68", "longitude": "-88.57",
+                 "place": "Chichen Itza", "confidence": "0.99"}]
+        state, merged = gemini_apply.merge_into_state(state, cand)
+        self.assertEqual(merged, 0)
+        self.assertEqual(state[0]["place"], "Old")
+
+    def test_merge_skips_no_match(self):
+        state = [{"asset_id": "a1", "file_name": "f1.jpg", "latitude": "",
+                  "longitude": "", "place": "", "source": "", "score": "",
+                  "status": "not_found", "maps_url": ""}]
+        cand = [{"asset_id": "a1", "status": "no_match",
+                 "latitude": "", "longitude": ""}]
+        state, merged = gemini_apply.merge_into_state(state, cand)
+        self.assertEqual(merged, 0)
+        self.assertEqual(state[0]["status"], "not_found")
 
 
 # ---------------------------------------------------------------------------
