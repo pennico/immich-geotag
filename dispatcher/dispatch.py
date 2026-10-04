@@ -17,7 +17,11 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
      session with the issue body and comments as the prompt. Two failed
      task sessions -> the issue gains the `blocker` label and the repo
      pauses.
-  4. If open PRs exist:
+  4. Main-branch CI: the latest run on main is checked every tick. A
+     red run gets one automatic fix session (pushed straight to main);
+     FAIL_STRIKES consecutive red fixes -> blocker + pause. A green run
+     resets the budget.
+  5. If open PRs exist:
        - merge PRs with BOTH review labels (`approved` + `approved-adversarial`)
          and green checks first (squash, delete branch);
        - two-reviewer pipeline, one review session per tick: a PR lacking
@@ -27,9 +31,9 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
          the PR (impl role, addresses the review comments) and invalidates
          prior approvals. Two failed review rounds on the same PR ->
          blocker + pause.
-  5. Else: run an Implementation session on the first unchecked ROADMAP.md
+  6. Else: run an Implementation session on the first unchecked ROADMAP.md
      item (a role tag in the item text selects the prompt; default impl).
-  6. Else: idle (roadmap complete) -> notify once.
+  7. Else: idle (roadmap complete) -> notify once.
 
 Delivery verification: when the loop considers the delivery complete —
 after a PR merges, and once when a repo goes idle — a verification
@@ -187,6 +191,18 @@ with the same commands the workflow runs.
   review pipeline automatically.
 When done: push the branch, then `git checkout main` so the working tree is
 left clean."""
+
+MAIN_CI_FIX_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
+The latest CI run on main ("{title}", run id {run_id}) is failing.
+- Find the failure: `gh run view {run_id} --log-failed`; reproduce it
+  locally with the same commands the workflow runs.
+- Fix it with a minimal change pushed directly to main. If the code is
+  correct but the CI environment lacks something (a system dependency,
+  a missing step in the workflow), fix the workflow instead. If the code
+  is wrong, fix the code.
+- Do not open a PR and do not touch open PR branches; fix main only.
+When done: push main and leave the working tree clean (`git status`
+empty)."""
 
 VERIFY_PROMPT = """You are the Delivery Verification agent for this repository (unattended headless run).
 The loop considers the delivery complete: {delivered}.
@@ -598,6 +614,8 @@ def tick(dry):
                          ("seen_prs", []), ("approved_prs", []),
                          ("launched_tasks", []), ("merge_failed_prs", []),
                          ("ci_fix_tried", []), ("ci_escalated", []),
+                         ("main_ci_fixed_runs", []), ("main_ci_strikes", 0),
+                         ("main_ci_escalated_runs", []),
                          ("verified_merges", []), ("verified_idle", False),
                          ("notified_done", False)):
         state.setdefault(key, default)
@@ -649,6 +667,7 @@ def tick(dry):
         state["verified_idle"] = False  # new work: re-verify before idle again
         state["ci_fix_tried"] = []     # fresh CI-fix budget too
         state["ci_escalated"] = []
+        state["main_ci_strikes"] = 0   # fresh main-CI budget as well
         state["failures"] = {}  # fresh failure budget after owner input
         maybe_save(state, dry)
         note = STASH_NOTE if state.get("stash_note_pending") else ""
@@ -661,6 +680,72 @@ def tick(dry):
             request_publish()
             maybe_save(state, dry)
         return "worked"
+
+    # --- main-branch CI: self-fix red runs before they reach the owner ---
+    # Direct pushes and squash-merges land on main without a PR gate,
+    # so a red main is only noticed via GitHub's failure emails. The
+    # loop checks the latest run each tick: one fix session per failed
+    # run, FAIL_STRIKES consecutive red fixes -> blocker + pause.
+    runs = gh_json(["gh", "run", "list", "--branch", "main", "--limit", "1",
+                    "--json", "databaseId,status,conclusion,displayTitle"])
+    if runs:
+        r = runs[0]
+        if r.get("status") == "completed" and r.get("conclusion") == "success":
+            state["main_ci_strikes"] = 0
+        elif (r.get("status") == "completed"
+              and r.get("conclusion") == "failure"
+              and r["databaseId"] not in state["main_ci_fixed_runs"]):
+            rid = r["databaseId"]
+            if state["main_ci_strikes"] >= FAIL_STRIKES:
+                if rid not in state["main_ci_escalated_runs"]:
+                    state["main_ci_escalated_runs"].append(rid)
+                    log(f"main CI run {rid} still red after "
+                        f"{FAIL_STRIKES} fix attempts; escalating")
+                    if dry:
+                        log("would file blocker: CI keeps failing on main")
+                    else:
+                        b = file_blocker(
+                            f"CI keeps failing on main: "
+                            f"{r.get('displayTitle', 'latest run')}",
+                            "The latest commits on main keep failing their "
+                            "automated checks (CI) even after automatic "
+                            "fix attempts (see this repo's Actions tab). "
+                            "The dispatcher paused this repo so nothing "
+                            "else runs on a broken main. Please take a "
+                            "look, then comment here and add the "
+                            "`answered` label to resume.")
+                        if b:
+                            state["seen_blockers"].append(b["number"])
+                            notify.notify(
+                                f"{REPO_NAME}: paused — CI keeps failing on main",
+                                f"{r.get('displayTitle', '')}\n\n"
+                                "Automatic fixes did not clear it. Comment "
+                                "on the issue and add the `answered` "
+                                "label (or reply here) to resume.",
+                                priority="high", tags="warning")
+                    maybe_save(state, dry)
+            else:
+                state["main_ci_fixed_runs"].append(rid)
+                state["main_ci_strikes"] += 1
+                log(f"main CI run {rid} red; launching fix session "
+                    f"(strike {state['main_ci_strikes']}/{FAIL_STRIKES})")
+                maybe_save(state, dry)
+                if dry:
+                    log("would run main-CI fix session")
+                else:
+                    notify.notify(f"{REPO_NAME}: CI red on main — auto-fix running",
+                                  f"{r.get('displayTitle', '')}\n\n"
+                                  "The dispatcher is trying to fix it; "
+                                  "you'll be notified again only if it "
+                                  "cannot.", tags="warning")
+                    code = run_session("impl", MAIN_CI_FIX_PROMPT.format(
+                        run_id=rid, title=r.get("displayTitle", "")))
+                    if code is None:
+                        return "abort"
+                    if code == 0:
+                        request_publish()
+                    maybe_save(state, dry)
+                    return "worked"
 
     # --- task issues: owner-filed work orders (launch from the phone) ---
     tasks = gh_json(["gh", "issue", "list", "--label", "task",
