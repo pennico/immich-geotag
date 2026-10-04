@@ -70,11 +70,12 @@ PROMPT_TEMPLATE = (
 # Gemini
 # ---------------------------------------------------------------------------
 
-def gemini_identify(images, api_key, model):
+def gemini_identify(images, api_key, model, retries=3, backoff=20):
     """Send a batch of JPEG byte strings to Gemini, return parsed results.
 
     Returns a list of dicts {index, place, city, country, confidence},
     one per image, in order. Missing/malformed entries become place=None.
+    Transient server errors (HTTP 5xx) are retried with a backoff.
     """
     n = len(images)
     parts = [{"text": PROMPT_TEMPLATE.format(n=n)}]
@@ -89,9 +90,19 @@ def gemini_identify(images, api_key, model):
         "contents": [{"parts": parts}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }
-    data = http_json("POST", GEMINI_URL.format(model),
-                     headers={"x-goog-api-key": api_key}, payload=payload,
-                     timeout=180)
+    for attempt in range(retries + 1):
+        try:
+            data = http_json("POST", GEMINI_URL.format(model),
+                             headers={"x-goog-api-key": api_key}, payload=payload,
+                             timeout=180)
+            break
+        except ApiError as e:
+            if attempt < retries and "HTTP 5" in str(e):
+                print("Gemini transient error (attempt {}/{}), retrying in {}s: {}".format(
+                    attempt + 1, retries + 1, backoff, str(e)[:120]))
+                time.sleep(backoff)
+                continue
+            raise
     text = ""
     for cand in data.get("candidates") or []:
         for part in (cand.get("content") or {}).get("parts") or []:
