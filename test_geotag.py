@@ -1405,16 +1405,17 @@ class TestGeocodePlace(unittest.TestCase):
         self.assertEqual(mock_geo.call_count, 1)
         mock_geo.assert_called_with("Chichen Itza, Tinum, Mexico", None)
 
-    def test_falls_back_to_place_only(self):
-        # Full and place+country queries fail; bare place resolves.
+    def test_falls_back_through_comma_segments(self):
+        # Full queries and the comma-containing place fail; the trailing
+        # parent site segment resolves.
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
-            mock_geo.side_effect = [None, None, (20.68, -88.56, "Chichen Itza")]
+            mock_geo.side_effect = [None, None, None, (20.68, -88.56, "Chichen Itza")]
             with mock.patch.object(gemini_candidates.time, "sleep"):
                 out = gemini_candidates.geocode_place(
                     "El Castillo, Chichen Itza", "Tinum", "Mexico", None)
         self.assertEqual(out, (20.68, -88.56, "Chichen Itza"))
-        self.assertEqual(mock_geo.call_count, 3)
-        self.assertEqual(mock_geo.call_args_list[2][0][0], "El Castillo, Chichen Itza")
+        self.assertEqual(mock_geo.call_count, 4)
+        self.assertEqual(mock_geo.call_args_list[3][0][0], "Chichen Itza")
 
     def test_all_fail_returns_none(self):
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
