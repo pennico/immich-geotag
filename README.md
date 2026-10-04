@@ -52,6 +52,27 @@ the usage ledger — add them to `geotag-data/usage.json` by hand.
 Deployment (cron schedule, container networking, seeded ledger) is
 documented in pennico-ops `homelab/README.md` ("Monthly geotag job").
 
+## Gemini candidate pass (gemini_candidates.py)
+
+Second-chance pass for photos the Vision scan marked `not_found`
+(Vision's landmark index misses photos that consumer Lens recognizes,
+e.g. full-view monument shots). Sends batches of preview JPEGs to
+`gemini-3.8-flash` (project policy: 3.8 or newer only), geocodes each
+identified place via Nominatim, and appends rows to
+`geotag-data/gemini_candidates.csv`:
+
+- **Never writes to Immich** — candidates are owner-reviewed first;
+  approved ones go through the normal `apply` flow.
+- Resume-safe: re-running skips asset_ids already in the CSV; stops
+  cleanly on Gemini 429 (free-tier daily limit) and resumes later.
+- One Gemini request per `--batch-size` images (default 8), so a
+  ~300-image window costs ~40 requests.
+
+```bash
+python3 gemini_candidates.py --after 2026-03-01 --before 2026-05-01
+python3 gemini_candidates.py --asset <uuid>     # single-image test
+```
+
 ## Data files
 
 `geotag-data/` (gitignored) holds the run state: `state.csv` (ledger),
