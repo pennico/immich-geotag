@@ -90,9 +90,9 @@ def card(r, color, label):
 def section(title, cards_html, note=""):
     if not cards_html:
         return ""
-    out = "<h2 class='section'>{}</h2>".format(title)
+    out = f"<h2 class='section'>{title}</h2>"
     if note:
-        out += "<p class='note'>{}</p>".format(note)
+        out += f"<p class='note'>{note}</p>"
     return out + "<div class='grid'>{}</div>".format("".join(cards_html))
 
 
@@ -176,9 +176,8 @@ def main():
     all_rows = load_rows()
     located, flagged, ungeocoded = split_rows(all_rows)
     no_match = sum(1 for r in all_rows if r["status"] == "no_match")
-    print("located: {}, flagged: {}, identified-but-ungeocoded: {}, "
-          "no_match total: {}".format(len(located), len(flagged),
-                                      len(ungeocoded), no_match))
+    print(f"located: {len(located)}, flagged: {len(flagged)}, identified-but-ungeocoded: {len(ungeocoded)}, "
+          f"no_match total: {no_match}")
 
     out = os.path.join(DATA, "gemini-review")
     if os.path.exists(out):

@@ -98,8 +98,7 @@ def gemini_identify(images, api_key, model, retries=3, backoff=20):
             break
         except ApiError as e:
             if attempt < retries and "HTTP 5" in str(e):
-                print("Gemini transient error (attempt {}/{}), retrying in {}s: {}".format(
-                    attempt + 1, retries + 1, backoff, str(e)[:120]))
+                print(f"Gemini transient error (attempt {attempt + 1}/{retries + 1}), retrying in {backoff}s: {str(e)[:120]}")
                 time.sleep(backoff)
                 continue
             raise
@@ -308,7 +307,7 @@ def main():
     except ValueError:
         model_ok = False
     if not model_ok:
-        sys.exit("Model policy: gemini-3.8 or newer only, got {}".format(args.model))
+        sys.exit(f"Model policy: gemini-3.8 or newer only, got {args.model}")
 
     immich = Immich(immich_url, immich_key)
 
@@ -324,23 +323,22 @@ def main():
             if a.get("type") == "IMAGE" and (exif.get("latitude") is None or exif.get("longitude") is None):
                 targets.append(a)
             else:
-                print("skip {}: not an IMAGE or already has GPS".format(aid))
+                print(f"skip {aid}: not an IMAGE or already has GPS")
     else:
         not_found_ids = {r.get("asset_id") for r in read_csv(args.state)
                          if r.get("status") == "not_found"}
         if not not_found_ids:
-            sys.exit("No not_found rows in {}".format(args.state))
+            sys.exit(f"No not_found rows in {args.state}")
         targets = list(window_assets(immich, args.after, args.before, not_found_ids))
 
     targets = [a for a in targets if a.get("id") not in done]
     if args.limit:
         targets = targets[:args.limit]
     if not targets:
-        print("nothing to do ({} already processed)".format(len(done)))
+        print(f"nothing to do ({len(done)} already processed)")
         return
 
-    print("{} target images, batch size {}, model {}".format(
-        len(targets), args.batch_size, args.model))
+    print(f"{len(targets)} target images, batch size {args.batch_size}, model {args.model}")
 
     rows = read_csv(args.out)
     geocode_cache = {}
@@ -364,9 +362,9 @@ def main():
         except ApiError as e:
             msg = str(e)
             if "HTTP 429" in msg:
-                print("Gemini quota reached, stopping cleanly (resume with same command): {}".format(msg))
+                print(f"Gemini quota reached, stopping cleanly (resume with same command): {msg}")
                 break
-            print("Gemini error, stopping cleanly: {}".format(msg))
+            print(f"Gemini error, stopping cleanly: {msg}")
             break
 
         for a, res in zip(kept, results):
@@ -396,7 +394,7 @@ def main():
                     row.update({
                         "latitude": str(lat), "longitude": str(lon),
                         "geocoded_name": name,
-                        "maps_url": "https://www.google.com/maps?q={:.5f},{:.5f}".format(lat, lon),
+                        "maps_url": f"https://www.google.com/maps?q={lat:.5f},{lon:.5f}",
                         "status": "candidate",
                     })
                     candidates += 1
@@ -411,9 +409,8 @@ def main():
         write_csv(args.out, rows, CANDIDATE_COLUMNS)  # crash-safe: write after each batch
 
     print("-" * 78)
-    print("done: {} candidates, {} no_match, {} processed of {} targets".format(
-        candidates, no_match, candidates + no_match, len(targets)))
-    print("output: {}".format(args.out))
+    print(f"done: {candidates} candidates, {no_match} no_match, {candidates + no_match} processed of {len(targets)} targets")
+    print(f"output: {args.out}")
 
 
 if __name__ == "__main__":

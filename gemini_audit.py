@@ -31,9 +31,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 import geotag  # noqa: E402
-from geotag import http_json  # noqa: E402
 from gemini_apply import haversine_km  # noqa: E402
 from gemini_candidates import gemini_identify, geocode_place  # noqa: E402
+from geotag import http_json  # noqa: E402
 
 AUDIT_COLUMNS = [
     "asset_id", "file_name", "taken_at", "existing_lat", "existing_lon",
@@ -88,7 +88,7 @@ def build_page(rows, sampled_of, every):
     counts = {}
     for r in rows:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-    summary = ", ".join("{} {}".format(v, k) for k, v in
+    summary = ", ".join(f"{v} {k}" for k, v in
                        sorted(counts.items())) or "nothing yet"
     cards = []
     for r in rows:
@@ -188,8 +188,7 @@ def main():
     sampled = sample_every(located, args.sample_every)
     if args.limit:
         sampled = sampled[:args.limit]
-    print("{} located photos, {} already audited, {} sampled this run".format(
-        len(located) + len(done), len(done), len(sampled)))
+    print(f"{len(located) + len(done)} located photos, {len(done)} already audited, {len(sampled)} sampled this run")
     if not sampled:
         print("nothing to do")
         return
@@ -212,7 +211,7 @@ def main():
                                       retries=args.retries,
                                       backoff=args.backoff)
         except geotag.ApiError as e:
-            print("Gemini error, stopping cleanly: {}".format(e))
+            print(f"Gemini error, stopping cleanly: {e}")
             break
 
         for a, res in zip(kept, results):
@@ -245,7 +244,7 @@ def main():
                     row.update({
                         "proposed_lat": str(lat), "proposed_lon": str(lon),
                         "geocoded_name": name,
-                        "distance_km": "{:.1f}".format(d),
+                        "distance_km": f"{d:.1f}",
                         "verdict": verdict_for(d),
                     })
                 else:
@@ -269,7 +268,7 @@ def main():
               encoding="utf-8") as f:
         f.write(build_page(rows, len(located) + len(done),
                            args.sample_every))
-    print("done: {} audited rows, output: {}".format(len(rows), args.out))
+    print(f"done: {len(rows)} audited rows, output: {args.out}")
 
 
 if __name__ == "__main__":
