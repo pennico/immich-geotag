@@ -1730,6 +1730,28 @@ class TestFlagOutliers(unittest.TestCase):
         # flag_outliers sets row["flag"]; the CSV schema must carry it
         self.assertIn("flag", gemini_candidates.CANDIDATE_COLUMNS)
 
+    def test_reviewed_rows_never_reflagged(self):
+        rows = [
+            self._row("a1", "applied", "2026-04-08T10:00:00Z", place="Wembley"),
+            self._row("a2", "candidate", "2026-04-20T10:00:00Z", place="Chichen"),
+            self._row("a3", "candidate", "2026-04-20T11:00:00Z", place="Chichen"),
+            self._row("a4", "candidate", "2026-04-20T12:00:00Z", place="Chichen"),
+        ]
+        rows[0]["flag"] = "reviewed"  # owner approved it on the review page
+        rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
+        self.assertEqual(flagged, 0)
+        self.assertEqual(rows[0]["flag"], "reviewed")
+
+    def test_reviewed_rows_still_anchor_isolation(self):
+        # A reviewed photo nearby must still prevent a false outlier flag.
+        rows = [
+            self._row("a1", "applied", "2026-04-08T10:00:00Z", place="Mexico City"),
+            self._row("a2", "candidate", "2026-04-08T11:00:00Z", place="Wembley"),
+        ]
+        rows[0]["flag"] = "reviewed"
+        rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
+        self.assertEqual(flagged, 0)
+
 
 class TestMergeIntoState(unittest.TestCase):
     def _state(self, status="not_found"):
