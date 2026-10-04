@@ -73,6 +73,38 @@ python3 gemini_candidates.py --after 2026-03-01 --before 2026-05-01
 python3 gemini_candidates.py --asset <uuid>     # single-image test
 ```
 
+`--allow-bbox` / `--airport-bbox` (repeatable) enforce the trip-geography
+rule: a geocode outside the allowed regions is disregarded and the next
+query variant is tried. This stops generic landmark names from resolving
+to same-named places on other continents (e.g. "Santo Domingo" church ->
+Dominican Republic instead of Oaxaca).
+
+## Applying candidates (gemini_apply.py)
+
+Approves and applies Gemini candidates to Immich. All decisions are
+persisted (`gemini_candidates.csv`, `asset_times.csv`), so nothing is ever
+re-run. Rules, in order:
+
+- **Recover**: high-confidence proposals whose geocode failed at scan
+  time are re-geocoded with the trip-geography validator.
+- **Confirm**: uncertain proposals (between `--floor` and
+  `--min-confidence`) are applied only when the photo's OWN proposal is
+  corroborated by neighboring located photos in time AND place
+  (`--hours` 2, `--km` 10). The proposal's coordinates are always used,
+  never a neighbor's. No proposal or a very low match leaves the geotag
+  blank.
+- **Flag**: small place-groups (`--max-group` 2) temporally isolated
+  (`--isolation-hours` 12) get `status=flagged` / `flag=outlier` for
+  owner review instead of being applied.
+- **Apply**: merges into `state.csv` and runs the normal `geotag.py`
+  apply flow (the only code path that writes to Immich).
+
+```bash
+python3 gemini_apply.py --dry-run    # plan only
+python3 gemini_apply.py --allow-bbox 14.5,-118.0,33.0,-86.0 \
+  --airport-bbox 24.0,-125.0,50.0,-66.0 --airport-bbox 51.0,-0.8,52.0,0.5
+```
+
 ## Data files
 
 `geotag-data/` (gitignored) holds the run state: `state.csv` (ledger),
