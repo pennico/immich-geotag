@@ -13,7 +13,9 @@ Configuration (environment or .env next to geotag.py):
   GEMINI_API_KEY   Gemini API key                (required)
   IMMICH_URL       e.g. https://immich.example   (required)
   IMMICH_API_KEY   Immich API key                (required)
-  NOMINATIM_EMAIL  contact email for Nominatim   (optional)
+  NOMINATIM_EMAIL    contact email for Nominatim   (optional)
+  IMMICH_PUBLIC_URL  browser-facing Immich URL for review links
+                     (optional, defaults to IMMICH_URL)
 
 Usage:
   python3 gemini_candidates.py --after 2026-03-01 --before 2026-05-01
@@ -157,9 +159,25 @@ def window_assets(immich, after, before, not_found_ids):
         page += 1
 
 
-def geocode_query(place, city, country):
-    """Build a Nominatim query string from identified place parts."""
-    return ", ".join(p for p in (place, city, country) if p)
+def geocode_place(place, city, country, email):
+    """Geocode an identified place via Nominatim, trying simpler queries first.
+
+    Nominatim treats commas as address components, so a full
+    "landmark, city, country" query often fails while the bare landmark
+    resolves. Try progressively simpler forms; first hit wins.
+    """
+    queries = []
+    for candidate in (", ".join(p for p in (place, city, country) if p),
+                      ", ".join(p for p in (place, country) if p),
+                      place):
+        if candidate and candidate not in queries:
+            queries.append(candidate)
+    for query in queries:
+        hit = nominatim_search(query, email)
+        if hit:
+            return hit
+        time.sleep(1)  # Nominatim usage policy: max 1 req/sec
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +205,7 @@ def main():
     immich_url = os.environ.get("IMMICH_URL", "")
     immich_key = os.environ.get("IMMICH_API_KEY", "")
     email = os.environ.get("NOMINATIM_EMAIL")
+    public_url = os.environ.get("IMMICH_PUBLIC_URL", immich_url).rstrip("/")
     missing = [k for k, v in [("GEMINI_API_KEY", api_key),
                               ("IMMICH_URL", immich_url),
                               ("IMMICH_API_KEY", immich_key)] if not v]
@@ -269,15 +288,15 @@ def main():
                 "confidence": "{:.2f}".format(res["confidence"]),
                 "latitude": "", "longitude": "", "geocoded_name": "",
                 "maps_url": "",
-                "immich_url": "{}/photos/{}".format(immich_url.rstrip("/"), a["id"]),
+                "immich_url": "{}/photos/{}".format(public_url, a["id"]),
                 "status": "no_match", "run_date": time.strftime("%Y-%m-%d"),
             }
             if res["place"] and res["confidence"] >= args.min_confidence:
-                query = geocode_query(res["place"], res["city"], res["country"])
-                if query not in geocode_cache:
-                    geocode_cache[query] = nominatim_search(query, email)
-                    time.sleep(1)  # Nominatim usage policy: max 1 req/sec
-                geo = geocode_cache[query]
+                cache_key = (res["place"], res["city"], res["country"])
+                if cache_key not in geocode_cache:
+                    geocode_cache[cache_key] = geocode_place(
+                        res["place"], res["city"], res["country"], email)
+                geo = geocode_cache[cache_key]
                 if geo:
                     lat, lon, name = geo
                     row.update({
