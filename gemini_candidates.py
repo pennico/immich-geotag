@@ -174,8 +174,11 @@ def geocode_place(place, city, country, email):
     """Geocode an identified place via Nominatim, trying simpler queries first.
 
     Nominatim treats commas as address components, so a full
-    "landmark, city, country" query often fails while the bare landmark
-    resolves. Try progressively simpler forms; first hit wins.
+    "landmark, city, country" query often fails while parts of it resolve.
+    Try progressively simpler forms; first hit wins. When the place name
+    itself is comma-separated ("El Castillo, Chichen Itza"), try its
+    segments in reverse order — the trailing parent site is usually the
+    landmark Nominatim knows.
     """
     queries = []
     for candidate in (", ".join(p for p in (place, city, country) if p),
@@ -183,6 +186,11 @@ def geocode_place(place, city, country, email):
                       place):
         if candidate and candidate not in queries:
             queries.append(candidate)
+    segments = [s.strip() for s in place.split(",") if s.strip()]
+    for segment in reversed(segments):
+        for candidate in (segment, ", ".join(p for p in (segment, country) if p)):
+            if candidate and candidate not in queries:
+                queries.append(candidate)
     for query in queries:
         hit = nominatim_search(query, email)
         if hit:
