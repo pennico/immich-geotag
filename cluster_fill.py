@@ -305,6 +305,46 @@ def build_review(rows, searched, max_images=300):
 # Main
 # ---------------------------------------------------------------------------
 
+def apply_approved(dry_run=False):
+    """Apply owner-approved review proposals from the ledger.
+
+    Every ledger row with status "review" is written to Immich, its
+    status becomes "applied", and each edit is appended to the edit
+    log. Idempotent: re-running applies nothing new.
+    """
+    ledger = load_ledger()
+    approved = [r for r in ledger.values() if r.get("status") == "review"]
+    if not approved:
+        print("no approved review proposals in the ledger")
+        return
+    print(f"applying {len(approved)} approved review proposals...")
+    immich = None
+    if not dry_run:
+        immich = geotag.Immich(os.environ["IMMICH_URL"],
+                               os.environ["IMMICH_API_KEY"])
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    edits = []
+    for r in approved:
+        if not dry_run:
+            immich.set_location(r["asset_id"], float(r["latitude"]),
+                                float(r["longitude"]))
+        r["status"] = "applied"
+        r["run_date"] = run_date
+        edits.append({
+            "run_date": run_date, "asset_id": r["asset_id"],
+            "file_name": r["file_name"], "match_id": r["match_id"],
+            "match_name": r["match_name"], "similarity": r["similarity"],
+            "latitude": r["latitude"], "longitude": r["longitude"],
+        })
+    if dry_run:
+        print(f"dry run: {len(edits)} locations would be applied")
+        return
+    write_ledger(list(ledger.values()))
+    append_edits(edits)
+    print(f"applied {len(edits)} locations to Immich "
+          f"(edit log: {os.path.relpath(EDITS, SCRIPT_DIR)})")
+
+
 def run(matches_path, dry_run=False, redo=False, min_sim=0.90,
         agree_m=100.0, solo_sim=0.96, max_dt=600.0):
     groups = parse_matches(matches_path)
@@ -397,12 +437,18 @@ def main():
     p.add_argument("--max-dt-min", type=float, default=10.0,
                    help="review proposals must have been taken within this "
                         "many minutes of their best match (10)")
+    p.add_argument("--apply-approved", action="store_true",
+                   help="apply the owner-approved review proposals in the "
+                        "ledger to Immich (no match CSV needed)")
     args = p.parse_args()
     geotag.load_env()
     for key in ("IMMICH_URL", "IMMICH_API_KEY"):
         if not os.environ.get(key):
             sys.exit(f"Missing configuration: {key} (set it in the environment "
                      f"or in {SCRIPT_DIR}/.env - see .env.example)")
+    if args.apply_approved:
+        apply_approved(dry_run=args.dry_run)
+        return
     run(args.matches, dry_run=args.dry_run, redo=args.redo,
         min_sim=args.min_sim, agree_m=args.agree_m, solo_sim=args.solo_sim,
         max_dt=args.max_dt_min * 60.0)
