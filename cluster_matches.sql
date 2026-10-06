@@ -1,7 +1,7 @@
 -- cluster_matches.sql: visually similar located photos for every
 -- unlocated image, via Immich's CLIP embeddings (smart_search, pgvector).
 --
--- Run on the homelab host (read-only):
+-- Run on the host running the Immich postgres container (read-only):
 --   docker exec -i immich_postgres psql -U postgres -d immich -At \
 --     < cluster_matches.sql > matches.csv
 --

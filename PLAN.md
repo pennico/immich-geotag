@@ -247,3 +247,11 @@ External APIs:
 6. If the hit rate on non-landmark photos is too low, get a SerpApi key,
    add it to `.env`, and re-run `recognize` (only `not_found` rows remain
    pending).
+
+## 8. What changed (per PR)
+
+- Publication prep (issue #6): MIT LICENSE added; README documents the
+  optional matching extensions (cluster_fill similarity autotag,
+  time-coherence rule, review app, --apply-approved) and drops
+  private-infrastructure references; CONTRIBUTING/SECURITY/issue
+  templates added; CI now runs the full test suite.

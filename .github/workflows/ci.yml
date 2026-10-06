@@ -18,4 +18,4 @@ jobs:
       - name: Lint
         run: ruff check .
       - name: Tests
-        run: pytest test_geotag.py -q
+        run: pytest -q

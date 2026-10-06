@@ -12,4 +12,4 @@ an [impl] session.
 Built outside the dispatcher chunks (owner session, 2026-09-29):
 `monthly_geotag.py` — self-running monthly backfill within the Vision
 free tier (usage ledger, never-retry state, ntfy summary). See README.md
-and pennico-ops `homelab/README.md` for the deployment.
+for usage and deployment notes.
