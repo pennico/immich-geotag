@@ -83,7 +83,7 @@ class TestConfirmTimeWindow(unittest.TestCase):
         m2["match_taken_at"] = 1000.0 + 99999  # years apart, still confident
         status, _, n, _ = cluster_fill.confirm([m1, m2], taken_at=5000.0)
         self.assertEqual(status, "confident")
-        self.assertEqual(n, 1)  # only best agrees with itself
+        self.assertEqual(n, 2)  # both agree spatially; time is irrelevant
 
     def test_single_very_high_match_is_confident(self):
         status, best, n, _ = cluster_fill.confirm([match(sim=0.97)])
@@ -211,6 +211,90 @@ class TestRun(unittest.TestCase):
         with open(cluster_fill.LEDGER) as f:
             rows = list(csv.DictReader(f))
         self.assertEqual(len(rows), 2)  # no duplicates
+
+
+class TestApplyApproved(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._paths = (cluster_fill.DATA, cluster_fill.LEDGER,
+                       cluster_fill.EDITS, cluster_fill.REVIEW)
+        cluster_fill.DATA = os.path.join(self.tmp, "cluster")
+        cluster_fill.LEDGER = os.path.join(self.tmp, "proposals.csv")
+        cluster_fill.EDITS = os.path.join(self.tmp, "edits.csv")
+        cluster_fill.REVIEW = os.path.join(self.tmp, "review")
+        os.makedirs(cluster_fill.DATA)
+        with open(cluster_fill.LEDGER, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cluster_fill.LEDGER_COLUMNS)
+            w.writeheader()
+            w.writerow({"asset_id": "a1", "file_name": "one.jpg",
+                        "latitude": "45.1", "longitude": "9.1",
+                        "similarity": "0.9300", "match_id": "m1",
+                        "match_name": "m.jpg", "n_matches": "1",
+                        "spread_m": "0", "status": "review",
+                        "maps_url": "u", "immich_url": "u",
+                        "run_date": "d"})
+            w.writerow({"asset_id": "a2", "file_name": "two.jpg",
+                        "latitude": "45.2", "longitude": "9.2",
+                        "similarity": "0.9500", "match_id": "m2",
+                        "match_name": "m2.jpg", "n_matches": "1",
+                        "spread_m": "0", "status": "applied",
+                        "maps_url": "u", "immich_url": "u",
+                        "run_date": "d"})
+
+    def tearDown(self):
+        (cluster_fill.DATA, cluster_fill.LEDGER, cluster_fill.EDITS,
+         cluster_fill.REVIEW) = self._paths
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_applies_review_rows_only(self):
+        applied = []
+
+        def fake_set_location(self, asset_id, lat, lon):
+            applied.append((asset_id, lat, lon))
+
+        orig = cluster_fill.geotag.Immich.set_location
+        cluster_fill.geotag.Immich.set_location = fake_set_location
+        try:
+            os.environ["IMMICH_URL"] = "http://test"
+            os.environ["IMMICH_API_KEY"] = "k"
+            cluster_fill.apply_approved()
+        finally:
+            cluster_fill.geotag.Immich.set_location = orig
+
+        self.assertEqual(applied, [("a1", 45.1, 9.1)])
+        with open(cluster_fill.LEDGER) as f:
+            rows = {r["asset_id"]: r for r in csv.DictReader(f)}
+        self.assertEqual(rows["a1"]["status"], "applied")
+        self.assertEqual(rows["a2"]["status"], "applied")  # untouched
+        with open(cluster_fill.EDITS) as f:
+            edits = list(csv.DictReader(f))
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["asset_id"], "a1")
+
+    def test_idempotent(self):
+        def fake_set_location(self, asset_id, lat, lon):
+            pass
+
+        orig = cluster_fill.geotag.Immich.set_location
+        cluster_fill.geotag.Immich.set_location = fake_set_location
+        try:
+            os.environ["IMMICH_URL"] = "http://test"
+            os.environ["IMMICH_API_KEY"] = "k"
+            cluster_fill.apply_approved()
+            cluster_fill.apply_approved()
+        finally:
+            cluster_fill.geotag.Immich.set_location = orig
+        with open(cluster_fill.EDITS) as f:
+            self.assertEqual(len(list(csv.DictReader(f))), 1)
+
+    def test_dry_run_writes_nothing(self):
+        os.environ["IMMICH_URL"] = "http://test"
+        os.environ["IMMICH_API_KEY"] = "k"
+        cluster_fill.apply_approved(dry_run=True)
+        self.assertFalse(os.path.exists(cluster_fill.EDITS))
+        with open(cluster_fill.LEDGER) as f:
+            rows = {r["asset_id"]: r for r in csv.DictReader(f)}
+        self.assertEqual(rows["a1"]["status"], "review")
 
 
 if __name__ == "__main__":
