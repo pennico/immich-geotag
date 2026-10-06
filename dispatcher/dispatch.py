@@ -512,19 +512,45 @@ class SessionResult:
         self.budget = budget
 
 
-# API-limit signatures in a dying session's output (case-insensitive).
+# API-limit signatures in a dying session's error output (case-insensitive).
 # A session that exits non-zero carrying one of these hit the Mistral
-# subscription limit, not a real failure (issue #15).
-QUOTA_SIG = re.compile(r"402|429|quota|rate[ _-]?limit|insufficient|"
-                       r"payment required|balance|credit|exceeded",
-                       re.IGNORECASE)
+# subscription limit, not a real failure (issue #15). The numeric codes are
+# anchored to an HTTP/status/error prefix or their status text, and words
+# that also occur in ordinary failures ("exceeded", "insufficient",
+# "credit") only match inside API-limit phrases — a line number, a token
+# count or "max turns exceeded" is never a quota death.
+QUOTA_SIG = re.compile(
+    r"\bhttps?(?:/1\.[01])?\s*[\"']?\s*(402|429)\b"
+    r"|\b(?:status|error|exit|response)(?:\s+code)?\s*[\"']?:?\s*(402|429)\b"
+    r"|\b(402|429)\s*[-:]\s*(?:too\s+many\s+requests|payment\s+required)\b"
+    r"|\b(402|429)\s+(?:too\s+many\s+requests|payment\s+required)\b"
+    r"|\bquota\b"
+    r"|\brate[ _-]?limits?\b"
+    r"|\binsufficient\s+(?:credit|balance|fund)"
+    r"|\bpayment\s+required\b"
+    r"|\bcredits?\s+(?:exhausted|depleted|ran\s+out)\b"
+    r"|\bout\s+of\s+credits?\b"
+    r"|\bbalance\s+(?:is\s+)?(?:too\s+low|exhausted)\b"
+    r"|\b(?:monthly|daily|weekly|usage|api|request|subscription)\s+limits?\b",
+    re.IGNORECASE)
+
+# Only this many final characters of a session's output are scanned for a
+# quota signature: the signature must come from the session's dying moments
+# (a CLI error, a traceback), not from a transcript that merely quoted
+# quota-related text — this file's own source, a plan, a review.
+OUTPUT_TAIL_S = 2000
 
 
 def is_quota_failure(code, output):
-    """True when a non-zero session exit carries an API-limit signature."""
+    """True when a non-zero session exit carries an API-limit signature.
+
+    Scans the final OUTPUT_TAIL_S characters of the combined output;
+    run_session passes stdout first and stderr last so the CLI's error
+    message (stderr) always lands inside the scanned window.
+    """
     if code in (0, 124, None):
         return False
-    return bool(QUOTA_SIG.search(output))
+    return bool(QUOTA_SIG.search(output[-OUTPUT_TAIL_S:]))
 
 
 def budget_read():
@@ -532,7 +558,9 @@ def budget_read():
 
     The counter file is shared by all repos' dispatchers (one subscription,
     one budget) and lives outside the repos, next to .publish-flags. A
-    missing or unreadable file must never block a tick: start at zero.
+    missing, unreadable or corrupt file must never block a tick: start at
+    zero — including a valid-JSON entry whose count is not an integer
+    (null, string), which would otherwise crash every tick.
     """
     today = time.strftime("%Y-%m-%d")
     try:
@@ -544,34 +572,83 @@ def budget_read():
             entry = {}
     except (OSError, ValueError):
         entry = {}
+    sessions = entry.get("sessions", 0)
+    if isinstance(sessions, bool) or not isinstance(sessions, int):
+        sessions = 0
+    entry["sessions"] = sessions
     return today, entry
 
 
 def budget_spent():
-    """True when today's shared session count reached the daily limit."""
+    """True when today's shared session count reached the daily limit.
+
+    Cheap unlocked read for the tick-top check; the authoritative
+    check-and-increment runs under the inter-process lock in
+    budget_reserve().
+    """
     if DAILY_SESSIONS <= 0:
         return False
     _, entry = budget_read()
-    return int(entry.get("sessions", 0)) >= DAILY_SESSIONS
+    return entry["sessions"] >= DAILY_SESSIONS
 
 
-def budget_increment():
-    """Count one session launch; notify the owner once when spent."""
-    if DAILY_SESSIONS <= 0:
-        return
-    today, entry = budget_read()
-    entry["sessions"] = int(entry.get("sessions", 0)) + 1
-    just_spent = (entry["sessions"] >= DAILY_SESSIONS
-                  and not entry.get("notified"))
-    if just_spent:
-        entry["notified"] = True
+def budget_lock():
+    """Open and exclusively lock the shared budget lock file, or None.
+
+    The counter is shared by every repo's dispatcher but the per-repo
+    .lock does not serialize them, so the read-check-increment needs its
+    own inter-process lock. Blocking is fine: the critical section is a
+    file read/write and the kernel releases the lock if the holder dies.
+    A locking problem must never block a tick: count nothing and let the
+    session run.
+    """
     try:
         BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
-        BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
-                                          sort_keys=True) + "\n")
+        fh = open(BUDGET_FILE.parent / (BUDGET_FILE.name + ".lock"), "a+")
     except OSError as e:
-        log(f"could not update session budget: {e}")
-        return
+        log(f"could not open session budget lock: {e}")
+        return None
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except OSError as e:
+        log(f"could not lock session budget: {e}")
+        fh.close()
+        return None
+    return fh
+
+
+def budget_reserve():
+    """Atomically check-and-increment the shared daily counter; returns
+    (ok, just_spent). ok=False: the budget is spent, nothing was counted
+    and the session must not launch. just_spent: this launch filled the
+    budget and the owner is notified once. Best-effort, like the old
+    increment-after-launch: a lock or write failure counts nothing and
+    lets the session run.
+    """
+    if DAILY_SESSIONS <= 0:
+        return True, False
+    fh = budget_lock()
+    if fh is None:
+        return True, False
+    just_spent = False
+    try:
+        today, entry = budget_read()
+        if entry["sessions"] >= DAILY_SESSIONS:
+            return False, False
+        entry["sessions"] += 1
+        just_spent = (entry["sessions"] >= DAILY_SESSIONS
+                      and not entry.get("notified"))
+        if just_spent:
+            entry["notified"] = True
+        try:
+            BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
+                                              sort_keys=True) + "\n")
+        except OSError as e:
+            log(f"could not update session budget: {e}")
+            just_spent = False
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
     if just_spent:
         notify.notify("agent loop: daily session budget spent",
                       f"{entry['sessions']}/{DAILY_SESSIONS} headless "
@@ -580,6 +657,30 @@ def budget_increment():
                       "the loop resumes tomorrow. No action needed — tune "
                       "DISPATCH_DAILY_SESSIONS if this is too tight.",
                       tags="warning")
+    return True, just_spent
+
+
+def budget_release():
+    """Give back one reserved session (the launch never happened, e.g.
+    the vibe binary is missing) so the shared day is not undercounted;
+    best-effort, never fatal."""
+    if DAILY_SESSIONS <= 0:
+        return
+    fh = budget_lock()
+    if fh is None:
+        return
+    try:
+        today, entry = budget_read()
+        if entry["sessions"] > 0:
+            entry["sessions"] -= 1
+            try:
+                BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
+                                                  sort_keys=True) + "\n")
+            except OSError as e:
+                log(f"could not update session budget: {e}")
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
 
 
 def enter_quota_pause(state):
@@ -621,7 +722,8 @@ def run_session(role, prompt):
     global _session_proc
     if _shutdown["requested"]:
         raise Shutdown()
-    if budget_spent():
+    ok, _ = budget_reserve()
+    if not ok:
         log(f"daily session budget spent; not launching {role} session")
         return SessionResult(None, budget=True)
     LOGDIR.mkdir(exist_ok=True)
@@ -637,8 +739,8 @@ def run_session(role, prompt):
                                stderr=subprocess.PIPE, text=True)
     except FileNotFoundError:
         log("ABORT: vibe CLI not found on PATH")
+        budget_release()
         return None
-    budget_increment()
     _session_proc = proc
     try:
         stdout, stderr = proc.communicate(timeout=SESSION_TIMEOUT_S)
@@ -655,7 +757,7 @@ def run_session(role, prompt):
     if code != 0 and (stderr or "").strip():
         (LOGDIR / f"{ts}-{role}.err").write_text(stderr)
     (LOGDIR / f"{ts}-{role}.exit").write_text(str(code) + "\n")
-    quota = is_quota_failure(code, (stderr or "") + "\n" + (stdout or ""))
+    quota = is_quota_failure(code, (stdout or "") + "\n" + (stderr or ""))
     log(f"{role} session finished, exit {code}"
         + (" (API quota/limit signature)" if quota else ""))
     if _shutdown["requested"]:
