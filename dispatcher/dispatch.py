@@ -109,8 +109,10 @@ MAX_TURNS_REVIEW = os.environ.get("DISPATCH_MAX_TURNS_REVIEW", "60")
 DAILY_SESSIONS = int(os.environ.get("DISPATCH_DAILY_SESSIONS", "14"))
 QUOTA_COOLDOWN_S = int(os.environ.get("DISPATCH_QUOTA_COOLDOWN_S",
                                       str(6 * 3600)))
+# Allowlist: any other value — including the natural way to say "off" —
+# must leave the default-off behavior alone.
 VERIFY_PER_MERGE = os.environ.get("DISPATCH_VERIFY_PER_MERGE", "").lower() \
-    not in ("", "0", "false", "no")
+    in ("1", "true", "yes")
 MAX_PRICE = os.environ.get("DISPATCH_MAX_PRICE", "10")
 SESSION_TIMEOUT_S = 5400
 FAIL_STRIKES = 2   # failed sessions per roadmap item before pausing
@@ -534,19 +536,22 @@ QUOTA_SIG = re.compile(
     r"|\b(?:monthly|daily|weekly|usage|api|request|subscription)\s+limits?\b",
     re.IGNORECASE)
 
-# Only this many final characters of a session's output are scanned for a
-# quota signature: the signature must come from the session's dying moments
-# (a CLI error, a traceback), not from a transcript that merely quoted
-# quota-related text — this file's own source, a plan, a review.
+# Only this many final characters of the CLI's error output are scanned
+# for a quota signature: the signature must come from the session's dying
+# moments (a CLI error, a traceback), not from text that merely quoted
+# quota-related content — this file's own source, a plan, a review.
 OUTPUT_TAIL_S = 2000
 
 
 def is_quota_failure(code, output):
     """True when a non-zero session exit carries an API-limit signature.
 
-    Scans the final OUTPUT_TAIL_S characters of the combined output;
-    run_session passes stdout first and stderr last so the CLI's error
-    message (stderr) always lands inside the scanned window.
+    Scans the final OUTPUT_TAIL_S characters of the CLI's own error
+    output: run_session passes stderr only, never the session transcript
+    (stdout) — a session implementing or reviewing the quota feature says
+    "quota" constantly, and its transcript must not turn a real crash into
+    a quota death. A signature that lands outside stderr falls back to
+    normal failure handling (strike + diagnosis), the safe direction.
     """
     if code in (0, 124, None):
         return False
@@ -737,8 +742,11 @@ def run_session(role, prompt):
     try:
         proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True)
-    except FileNotFoundError:
-        log("ABORT: vibe CLI not found on PATH")
+    except OSError as e:
+        # missing, not executable (broken update, noexec mount), ... —
+        # the launch never happened, so give the reserved unit back or
+        # every occurrence permanently shrinks the shared daily budget.
+        log(f"ABORT: could not launch vibe CLI: {e}")
         budget_release()
         return None
     _session_proc = proc
@@ -757,7 +765,10 @@ def run_session(role, prompt):
     if code != 0 and (stderr or "").strip():
         (LOGDIR / f"{ts}-{role}.err").write_text(stderr)
     (LOGDIR / f"{ts}-{role}.exit").write_text(str(code) + "\n")
-    quota = is_quota_failure(code, (stdout or "") + "\n" + (stderr or ""))
+    # Quota classification reads the CLI's own error output (stderr) only:
+    # the transcript (stdout) routinely discusses quotas/rate limits and
+    # must not mask a real crash as an API-limit death.
+    quota = is_quota_failure(code, stderr or "")
     log(f"{role} session finished, exit {code}"
         + (" (API quota/limit signature)" if quota else ""))
     if _shutdown["requested"]:
