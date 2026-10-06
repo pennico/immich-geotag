@@ -25,21 +25,57 @@ import json
 import os
 import sys
 
+import cluster_fill
 import geotag
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = os.path.join(SCRIPT_DIR, "geotag-data", "cluster", "proposals.csv")
+DEFAULT_MATCHES = os.path.join(SCRIPT_DIR, "geotag-data", "cluster", "matches.csv")
 DEFAULT_OUT = os.path.join(SCRIPT_DIR, "geotag-data", "cluster-review-app")
 
+# Confirmation thresholds (mirror cluster_fill.confirm defaults).
+MIN_SIM = 0.90
+AGREE_M = 100.0
+MAX_CLUSTER_SHOWN = 6
+
 # (asset_id, file_name, lat, lon, similarity, match_id, match_name,
-#  n_matches, spread_m, status, maps_url, immich_url)
+#  n_matches, spread_m, status, maps_url, immich_url, cluster)
 FIELDS = ("asset_id", "file_name", "latitude", "longitude", "similarity",
           "match_id", "match_name", "n_matches", "spread_m", "status",
           "maps_url", "immich_url")
 
 
-def compact_rows(rows):
+def build_clusters(rows, matches_path, max_shown=MAX_CLUSTER_SHOWN):
+    """Per proposal row, the cluster of similar located photos considered.
+
+    Returns {asset_id: [[match_id, match_name, similarity, agree], ...]}
+    sorted by similarity (desc), capped at max_shown. "agree" mirrors the
+    confirmation rule: similarity >= MIN_SIM and within AGREE_M of the
+    proposed coordinates. Empty dict when matches.csv is missing.
+    """
+    if not os.path.exists(matches_path):
+        return {}
+    groups = cluster_fill.parse_matches(matches_path)
+    clusters = {}
+    for r in rows:
+        g = groups.get(r["asset_id"])
+        if not g:
+            continue
+        lat, lon = float(r["latitude"]), float(r["longitude"])
+        entries = []
+        for m in sorted(g["matches"], key=lambda m: -m["similarity"]):
+            agree = (m["similarity"] >= MIN_SIM
+                     and cluster_fill.haversine_m(lat, lon, m["latitude"],
+                                                  m["longitude"]) <= AGREE_M)
+            entries.append([m["match_id"], m["match_name"],
+                            round(m["similarity"], 4), int(agree)])
+        clusters[r["asset_id"]] = entries[:max_shown]
+    return clusters
+
+
+def compact_rows(rows, clusters=None):
     """Project CSV rows into compact tuples for embedding as JSON."""
+    clusters = clusters or {}
     out = []
     for r in rows:
         out.append([
@@ -49,16 +85,20 @@ def compact_rows(rows):
             r["match_id"], r["match_name"],
             int(r["n_matches"]), int(float(r["spread_m"])),
             r["status"], r["maps_url"], r["immich_url"],
+            clusters.get(r["asset_id"], []),
         ])
     return out
 
 
-def image_ids(rows):
-    """Unique asset ids needed as thumbnails (photo + match, deduped)."""
+def image_ids(rows, clusters=None):
+    """Unique asset ids needed as thumbnails (photo + cluster, deduped)."""
+    clusters = clusters or {}
     ids = set()
     for r in rows:
         ids.add(r["asset_id"])
         ids.add(r["match_id"])
+        for m in clusters.get(r["asset_id"], []):
+            ids.add(m[0])
     return sorted(ids)
 
 
@@ -121,6 +161,15 @@ PAGE = """<!DOCTYPE html>
  a {{ color: #0a84ff; text-decoration: none; }}
  .badge {{ color: #fff; font-size: 11px; padding: 2px 8px; border-radius: 8px; }}
  .sel {{ position: absolute; top: 8px; right: 8px; width: 22px; height: 22px; }}
+ .strip {{ display: flex; gap: 6px; padding: 0 14px 4px; flex-wrap: wrap; }}
+ .thumb {{ position: relative; width: 72px; }}
+ .thumb img {{ width: 72px; height: 54px; object-fit: cover; display: block;
+              border-radius: 6px; border: 2px solid #c7c7cc; background: #e5e5ea; }}
+ .thumb.agree img {{ border-color: #30d158; }}
+ .thumb span {{ position: absolute; bottom: 2px; right: 2px;
+               background: rgba(0,0,0,.6); color: #fff; font-size: 9px;
+               padding: 1px 4px; border-radius: 4px; }}
+ .cluhead {{ font-size: 11px; color: #8e8e93; padding: 8px 14px 4px; margin: 0; }}
  #selbar {{ display: none; position: fixed; bottom: 16px; left: 50%;
            transform: translateX(-50%); background: #1c1c1e; color: #fff;
            padding: 10px 18px; border-radius: 12px; font-size: 13px;
@@ -133,8 +182,10 @@ PAGE = """<!DOCTYPE html>
 <header>
  <h1>Cluster fill — review</h1>
  <p id="summary"></p>
- <p>Green = already applied to Immich. Orange = proposal only. Tick the good
- proposals and copy their asset IDs to send back for approval.</p>
+ <p>Green = already applied to Immich. Orange = proposal only. Each card shows
+ the photo, its best match, and the cluster of similar located photos that
+ voted (green border = agrees within 100 m). Tick the good proposals and copy
+ their asset IDs to send back for approval.</p>
 </header>
 <div class="bar">
  <label>Status
@@ -168,8 +219,14 @@ function esc(s) {{
 }}
 
 function card(r) {{
-  const [aid, name, lat, lon, sim, mid, mname, n, spread, status, maps, immich] = r;
+  const [aid, name, lat, lon, sim, mid, mname, n, spread, status, maps, immich, cluster] = r;
   const checked = selected.has(aid) ? "checked" : "";
+  const strip = cluster.map(m =>
+    `<div class="thumb ${{m[3] ? "agree" : ""}}" title="${{esc(m[1])}} (sim ${{m[2]}})${{m[3] ? " - agrees" : ""}}">
+       <img loading="lazy" src="images/${{m[0]}}.jpg"
+            onerror="this.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22/%3E'">
+       <span>${{m[2].toFixed(2)}}</span>
+     </div>`).join("");
   return `<div class="card">
     <div class="pair">
       <img loading="lazy" src="images/${{aid}}.jpg" alt="${{esc(name)}}"
@@ -188,6 +245,7 @@ function card(r) {{
       <p><a href="${{maps}}" target="_blank">Google Maps</a> &middot;
          <a href="${{immich}}" target="_blank">Open in Immich</a></p>
     </div>
+    ${{cluster.length ? `<p class="cluhead">Cluster - similar located photos (green border = agrees within 100 m):</p><div class="strip">${{strip}}</div>` : ""}}
   </div>`;
 }}
 
@@ -244,16 +302,18 @@ applyFilters();
 </body></html>"""
 
 
-def render_page(rows):
+def render_page(rows, clusters=None):
     """Return the full index.html for the given compact rows."""
     # Escape "<" so a filename can never break out of the script block.
-    data = json.dumps(compact_rows(rows)).replace("<", "\\u003c")
+    data = json.dumps(compact_rows(rows, clusters)).replace("<", "\\u003c")
     return PAGE.format(rows=data)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--data", default=DEFAULT_DATA)
+    ap.add_argument("--matches", default=DEFAULT_MATCHES,
+                    help="pgvector match dump used to show full clusters")
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument("--limit", type=int, default=None,
                     help="only include the first N rows (testing)")
@@ -267,18 +327,20 @@ def main():
     if not rows:
         sys.exit("no rows in " + args.data)
 
+    clusters = build_clusters(rows, args.matches)
+
     if not args.skip_images:
         geotag.load_env()
         immich = geotag.Immich(os.environ["IMMICH_URL"],
                                os.environ["IMMICH_API_KEY"])
-        ids = image_ids(rows)
+        ids = image_ids(rows, clusters)
         ok, failed = download_images(immich, ids,
                                      os.path.join(args.out, "images"))
         print(f"thumbnails: {ok} ok, {len(failed)} failed, "
               f"{len(ids) - ok - len(failed)} skipped")
 
     os.makedirs(args.out, exist_ok=True)
-    page = render_page(rows)
+    page = render_page(rows, clusters)
     with open(os.path.join(args.out, "index.html"), "w",
               encoding="utf-8") as f:
         f.write(page)
