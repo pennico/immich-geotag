@@ -17,9 +17,10 @@ Confirmation rules (conservative, add-only):
   review     everything else, provided the photo and its best match were
               taken within --max-dt-min (10) minutes of each other (same
               shooting session); when either EXIF date is missing the
-              proposal stays review. Proposed but NOT applied; the owner
-              approves on the review page (mark status=candidate in the
-              ledger and re-run to apply).
+              proposal stays review. Proposed but NOT applied; review
+              the proposals (cluster_review_app.py), remove the ones
+              you reject from the ledger, and re-run with
+              --apply-approved to apply the rest.
   rejected   a proposal whose best match was taken further than the time
               window away - visual similarity alone, different session.
 
@@ -32,6 +33,7 @@ Usage:
   python3 cluster_fill.py geotag-data/cluster/matches.csv --dry-run
   python3 cluster_fill.py geotag-data/cluster/matches.csv
   python3 cluster_fill.py geotag-data/cluster/matches.csv --redo
+  python3 cluster_fill.py --apply-approved   # apply approved proposals
 """
 import argparse
 import csv
@@ -231,7 +233,8 @@ PAGE = """<!DOCTYPE html>
  location were searched.</p>
  <p>Green = applied (coordinates from the best similar located photo).
  Orange = proposal only - review and approve the good ones in
- proposals.csv (status -> candidate), then re-run to apply.</p>
+ proposals.csv (keep only the rows you approve), then re-run with
+ --apply-approved to apply.</p>
 </header>
 {}
 </body></html>"""
