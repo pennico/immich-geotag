@@ -14,9 +14,14 @@ Confirmation rules (conservative, add-only):
   confident  >= 2 matches with similarity >= --min-sim (0.90) that agree
               within --agree-m (100 m), or a single match with
               similarity >= --solo-sim (0.96).
-  review     everything else: proposed but NOT applied; the owner
+  review     everything else, provided the photo and its best match were
+              taken within --max-dt-min (10) minutes of each other (same
+              shooting session); when either EXIF date is missing the
+              proposal stays review. Proposed but NOT applied; the owner
               approves on the review page (mark status=candidate in the
               ledger and re-run to apply).
+  rejected   a proposal whose best match was taken further than the time
+              window away - visual similarity alone, different session.
 
 Every applied edit is appended to geotag-data/cluster/cluster_edits.csv
 (timestamp, asset, source match, coordinates) so any edit can be traced
@@ -49,7 +54,7 @@ EDITS = os.path.join(DATA, "cluster_edits.csv")
 LEDGER_COLUMNS = [
     "asset_id", "file_name", "latitude", "longitude", "similarity",
     "match_id", "match_name", "n_matches", "spread_m", "status",
-    "maps_url", "immich_url", "run_date",
+    "maps_url", "immich_url", "run_date", "taken_at", "match_taken_at",
 ]
 
 EDIT_COLUMNS = [
@@ -58,9 +63,12 @@ EDIT_COLUMNS = [
 ]
 
 # Match CSV columns, positional (COPY ... TO STDOUT, no header):
-# asset_id, file_name, match_id, match_name, similarity, latitude, longitude
-MATCH_COLUMNS = ["asset_id", "file_name", "match_id", "match_name",
-                 "similarity", "latitude", "longitude"]
+# asset_id, file_name, taken_at, match_id, match_name, match_taken_at,
+# similarity, latitude, longitude (taken_at = epoch seconds, NULL when
+# the EXIF date is missing)
+MATCH_COLUMNS = ["asset_id", "file_name", "taken_at", "match_id",
+                 "match_name", "match_taken_at", "similarity",
+                 "latitude", "longitude"]
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +90,8 @@ def parse_matches(path):
     """Read the pgvector match dump -> {asset_id: {name, matches: [...]}}.
 
     Matches arrive sorted by similarity (descending) per asset; the parser
-    does not rely on the order.
+    does not rely on the order. Timestamps (epoch seconds) are optional:
+    an empty/invalid value becomes None and the row is still kept.
     """
     groups = {}
     with open(path, newline="", encoding="utf-8") as f:
@@ -96,21 +105,47 @@ def parse_matches(path):
                 rec["longitude"] = float(rec["longitude"])
             except ValueError:
                 continue
+            rec["taken_at"] = _opt_float(rec["taken_at"])
+            rec["match_taken_at"] = _opt_float(rec["match_taken_at"])
             g = groups.setdefault(rec["asset_id"],
                                    {"file_name": rec["file_name"],
+                                    "taken_at": rec["taken_at"],
                                     "matches": []})
             g["matches"].append(rec)
     return groups
 
 
-def confirm(matches, min_sim=0.90, agree_m=100.0, solo_sim=0.96):
+def _opt_float(value):
+    """Parse a float that may be empty/NULL -> None."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_epoch(value):
+    """Epoch seconds -> 'YYYY-MM-DD HH:MM' (UTC) or ''."""
+    if value is None:
+        return ""
+    return datetime.fromtimestamp(value, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M")
+
+
+def confirm(matches, min_sim=0.90, agree_m=100.0, solo_sim=0.96,
+            taken_at=None, max_dt=600.0):
     """Apply the confirmation rules to one asset's matches.
 
     Returns (status, best, n_agree, spread_m):
-      status    "confident" or "review"
+      status    "confident", "review" or "rejected"
       best      the highest-similarity match (coordinates source)
       n_agree   how many >= min_sim matches agree with best within agree_m
       spread_m  max distance of the agreeing matches from best
+
+    Time-coherence rule for proposals that fail the spatial rules: the
+    photo and its best match must have been taken within max_dt seconds
+    of each other (same shooting session). Proposals outside the window
+    are "rejected"; when either EXIF date is missing the proposal stays
+    "review" (the owner judges it on the review page).
     """
     best = max(matches, key=lambda m: m["similarity"])
     agreeing = [m for m in matches if m["similarity"] >= min_sim]
@@ -122,6 +157,9 @@ def confirm(matches, min_sim=0.90, agree_m=100.0, solo_sim=0.96):
                   for m in close), default=0.0)
     if len(close) >= 2 or best["similarity"] >= solo_sim:
         return "confident", best, len(close), round(spread)
+    if (taken_at is not None and best.get("match_taken_at") is not None
+            and abs(taken_at - best["match_taken_at"]) > max_dt):
+        return "rejected", best, len(close), round(spread)
     return "review", best, len(close), round(spread)
 
 
@@ -268,19 +306,21 @@ def build_review(rows, searched, max_images=300):
 # ---------------------------------------------------------------------------
 
 def run(matches_path, dry_run=False, redo=False, min_sim=0.90,
-        agree_m=100.0, solo_sim=0.96):
+        agree_m=100.0, solo_sim=0.96, max_dt=600.0):
     groups = parse_matches(matches_path)
     ledger = {} if redo else load_ledger()
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    rows, edits, applied_n, review_n, skipped_n = [], [], 0, 0, 0
+    rows, edits, applied_n, review_n, rejected_n, skipped_n = \
+        [], [], 0, 0, 0, 0
     for asset_id, g in groups.items():
         if asset_id in ledger:
             rows.append(ledger[asset_id])
             skipped_n += 1
             continue
         status, best, n_agree, spread = confirm(g["matches"], min_sim,
-                                                agree_m, solo_sim)
+                                                agree_m, solo_sim,
+                                                g.get("taken_at"), max_dt)
         row = {
             "asset_id": asset_id,
             "file_name": g["file_name"],
@@ -298,6 +338,8 @@ def run(matches_path, dry_run=False, redo=False, min_sim=0.90,
                                os.environ.get("IMMICH_URL", "")).rstrip("/"),
                 asset_id),
             "run_date": run_date,
+            "taken_at": _fmt_epoch(g.get("taken_at")),
+            "match_taken_at": _fmt_epoch(best.get("match_taken_at")),
         }
         if status == "confident":
             if not dry_run:
@@ -314,6 +356,9 @@ def run(matches_path, dry_run=False, redo=False, min_sim=0.90,
                     "latitude": row["latitude"], "longitude": row["longitude"],
                 })
             applied_n += 1
+        elif status == "rejected":
+            row["status"] = "rejected"
+            rejected_n += 1
         else:
             review_n += 1
         rows.append(row)
@@ -321,6 +366,7 @@ def run(matches_path, dry_run=False, redo=False, min_sim=0.90,
     print("-" * 78)
     print(f"searched {len(groups)} unlocated photos")
     print(f"confident: {applied_n}  review: {review_n}  "
+          f"rejected (time window): {rejected_n}  "
           f"already processed: {skipped_n}")
     if dry_run:
         print("dry run: nothing written, no review page built")
@@ -348,6 +394,9 @@ def main():
                    help="max distance between agreeing matches (100 m)")
     p.add_argument("--solo-sim", type=float, default=0.96,
                    help="a single match at this similarity is confident (0.96)")
+    p.add_argument("--max-dt-min", type=float, default=10.0,
+                   help="review proposals must have been taken within this "
+                        "many minutes of their best match (10)")
     args = p.parse_args()
     geotag.load_env()
     for key in ("IMMICH_URL", "IMMICH_API_KEY"):
@@ -355,7 +404,8 @@ def main():
             sys.exit(f"Missing configuration: {key} (set it in the environment "
                      f"or in {SCRIPT_DIR}/.env - see .env.example)")
     run(args.matches, dry_run=args.dry_run, redo=args.redo,
-        min_sim=args.min_sim, agree_m=args.agree_m, solo_sim=args.solo_sim)
+        min_sim=args.min_sim, agree_m=args.agree_m, solo_sim=args.solo_sim,
+        max_dt=args.max_dt_min * 60.0)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,41 @@ class TestConfirm(unittest.TestCase):
         m2 = match(mid="m2", sim=0.92, lat=46.0, lon=10.0)  # far away
         status, best, n, _ = cluster_fill.confirm([m1, m2])
         self.assertEqual(status, "review")
+
+
+class TestConfirmTimeWindow(unittest.TestCase):
+    def test_time_close_proposal_stays_review(self):
+        m = match(sim=0.93)
+        m["match_taken_at"] = 1000.0
+        status, _, _, _ = cluster_fill.confirm([m], taken_at=1000.0,
+                                               max_dt=600.0)
+        self.assertEqual(status, "review")
+
+    def test_time_far_proposal_is_rejected(self):
+        m = match(sim=0.93)
+        m["match_taken_at"] = 1000.0
+        status, _, _, _ = cluster_fill.confirm([m], taken_at=1000.0 + 7200,
+                                               max_dt=600.0)
+        self.assertEqual(status, "rejected")
+
+    def test_missing_timestamps_stay_review(self):
+        m = match(sim=0.93)  # no match_taken_at
+        status, _, _, _ = cluster_fill.confirm([m], taken_at=None,
+                                               max_dt=600.0)
+        self.assertEqual(status, "review")
+        m2 = match(sim=0.93)
+        m2["match_taken_at"] = 1000.0
+        status, _, _, _ = cluster_fill.confirm([m2], taken_at=None,
+                                               max_dt=600.0)
+        self.assertEqual(status, "review")
+
+    def test_confident_ignores_time_window(self):
+        m1 = match(sim=0.95, lat=45.0, lon=9.0)
+        m1["match_taken_at"] = 1000.0
+        m2 = match(mid="m2", sim=0.91, lat=45.0005, lon=9.0005)
+        m2["match_taken_at"] = 1000.0 + 99999  # years apart, still confident
+        status, _, n, _ = cluster_fill.confirm([m1, m2], taken_at=5000.0)
+        self.assertEqual(status, "confident")
         self.assertEqual(n, 1)  # only best agrees with itself
 
     def test_single_very_high_match_is_confident(self):
@@ -72,12 +107,12 @@ class TestParseMatches(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".csv",
                                          delete=False) as f:
             w = csv.writer(f)
-            w.writerow(["a1", "one.jpg", "m1", "m.jpg", "0.9500",
-                        "45.1000", "9.1000"])
-            w.writerow(["a1", "one.jpg", "m2", "m2.jpg", "0.9100",
-                        "45.2000", "9.2000"])
-            w.writerow(["a2", "two.jpg", "m1", "m.jpg", "0.8700",
-                        "45.1000", "9.1000"])
+            w.writerow(["a1", "one.jpg", "1000", "m1", "m.jpg", "995",
+                        "0.9500", "45.1000", "9.1000"])
+            w.writerow(["a1", "one.jpg", "1000", "m2", "m2.jpg", "990",
+                        "0.9100", "45.2000", "9.2000"])
+            w.writerow(["a2", "two.jpg", "1000", "m1", "m.jpg", "870",
+                        "0.8700", "45.1000", "9.1000"])
             path = f.name
         try:
             groups = cluster_fill.parse_matches(path)
@@ -93,7 +128,7 @@ class TestParseMatches(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".csv",
                                          delete=False) as f:
             f.write("a1,one.jpg,m1\n")  # too few columns
-            f.write("a1,one.jpg,m1,m.jpg,notafloat,45.0,9.0\n")
+            f.write("a1,one.jpg,,m1,m.jpg,,notafloat,45.0,9.0\n")
             path = f.name
         try:
             self.assertEqual(cluster_fill.parse_matches(path), {})
@@ -114,13 +149,13 @@ class TestRun(unittest.TestCase):
         with open(self.matches, "w") as f:
             w = csv.writer(f)
             # confident: two agreeing
-            w.writerow(["a1", "one.jpg", "m1", "m.jpg", "0.9500",
-                        "45.1000", "9.1000"])
-            w.writerow(["a1", "one.jpg", "m2", "m2.jpg", "0.9200",
-                        "45.1005", "9.1005"])
-            # review: single mid match
-            w.writerow(["a2", "two.jpg", "m1", "m.jpg", "0.9000",
-                        "45.1000", "9.1000"])
+            w.writerow(["a1", "one.jpg", "1000", "m1", "m.jpg", "995",
+                        "0.9500", "45.1000", "9.1000"])
+            w.writerow(["a1", "one.jpg", "1000", "m2", "m2.jpg", "990",
+                        "0.9200", "45.1005", "9.1005"])
+            # review: single mid match, taken 5 s apart
+            w.writerow(["a2", "two.jpg", "1000", "m1", "m.jpg", "995",
+                        "0.9000", "45.1000", "9.1000"])
 
     def tearDown(self):
         (cluster_fill.DATA, cluster_fill.LEDGER, cluster_fill.EDITS,

@@ -17,12 +17,13 @@ import cluster_review_app
 
 def row(aid="a1", name="f1.jpg", lat="45.123456", lon="9.654321",
         sim="0.9123", mid="m1", mname="match1.jpg", n="3",
-        spread="12.5", status="review"):
+        spread="12.5", status="review", taken="", match_taken=""):
     return {"asset_id": aid, "file_name": name, "latitude": lat,
             "longitude": lon, "similarity": sim, "match_id": mid,
             "match_name": mname, "n_matches": n, "spread_m": spread,
             "status": status, "maps_url": "https://maps.example/?q=45,9",
-            "immich_url": "https://immich.example/photos/" + aid}
+            "immich_url": "https://immich.example/photos/" + aid,
+            "taken_at": taken, "match_taken_at": match_taken}
 
 
 class TestCompactRows(unittest.TestCase):
@@ -38,7 +39,20 @@ class TestCompactRows(unittest.TestCase):
         self.assertEqual(out[7], 3)
         self.assertEqual(out[8], 12)
         self.assertEqual(out[9], "review")
-        self.assertEqual(len(out), len(cluster_review_app.FIELDS) + 1)  # +cluster
+        self.assertEqual(out[12], [])  # cluster defaults to empty
+        self.assertEqual(out[13], "")  # taken_at
+        self.assertIsNone(out[15])    # dt_min
+        self.assertEqual(len(out), len(cluster_review_app.FIELDS) + 2)
+
+    def test_dt_minutes_computed(self):
+        rows = [row(taken="2026-03-15 12:00", match_taken="2026-03-15 12:05")]
+        out = cluster_review_app.compact_rows(rows)[0]
+        self.assertEqual(out[15], 5.0)
+
+    def test_dt_ignored_when_timestamps_missing(self):
+        rows = [row(taken="2026-03-15 12:00")]
+        out = cluster_review_app.compact_rows(rows)[0]
+        self.assertIsNone(out[15])
 
     def test_empty(self):
         self.assertEqual(cluster_review_app.compact_rows([]), [])
@@ -66,16 +80,20 @@ class TestBuildClusters(unittest.TestCase):
         self.matches = os.path.join(self.tmp, "matches.csv")
         with open(self.matches, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["asset_id", "file_name", "match_id", "match_name",
-                        "similarity", "latitude", "longitude"])
+            w.writerow(["asset_id", "file_name", "taken_at", "match_id",
+                        "match_name", "match_taken_at", "similarity",
+                        "latitude", "longitude"])
             # best match + two agreeing + one far away + one low-sim
-            w.writerow(["a1", "f1.jpg", "m1", "m1.jpg", 0.95, 45.0, 9.0])
-            w.writerow(["a1", "f1.jpg", "m2", "m2.jpg", 0.93,
-                        45.0005, 9.0005])   # ~70 m -> agrees
-            w.writerow(["a1", "f1.jpg", "m3", "m3.jpg", 0.91,
-                        45.001, 9.001])     # ~140 m -> no
-            w.writerow(["a1", "f1.jpg", "m4", "m4.jpg", 0.85, 45.0, 9.0])
-            w.writerow(["a2", "f2.jpg", "m5", "m5.jpg", 0.99, 45.0, 9.0])
+            w.writerow(["a1", "f1.jpg", "1000", "m1", "m1.jpg", "995",
+                        0.95, 45.0, 9.0])
+            w.writerow(["a1", "f1.jpg", "1000", "m2", "m2.jpg", "990",
+                        0.93, 45.0005, 9.0005])   # ~70 m -> agrees
+            w.writerow(["a1", "f1.jpg", "1000", "m3", "m3.jpg", "985",
+                        0.91, 45.001, 9.001])     # ~140 m -> no
+            w.writerow(["a1", "f1.jpg", "1000", "m4", "m4.jpg", "980",
+                        0.85, 45.0, 9.0])
+            w.writerow(["a2", "f2.jpg", "1000", "m5", "m5.jpg", "995",
+                        0.99, 45.0, 9.0])
 
     def tearDown(self):
         import shutil

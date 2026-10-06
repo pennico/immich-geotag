@@ -39,10 +39,10 @@ AGREE_M = 100.0
 MAX_CLUSTER_SHOWN = 6
 
 # (asset_id, file_name, lat, lon, similarity, match_id, match_name,
-#  n_matches, spread_m, status, maps_url, immich_url, cluster)
+#  n_matches, spread_m, status, maps_url, immich_url)
 FIELDS = ("asset_id", "file_name", "latitude", "longitude", "similarity",
           "match_id", "match_name", "n_matches", "spread_m", "status",
-          "maps_url", "immich_url")
+          "maps_url", "immich_url", "taken_at", "match_taken_at")
 
 
 def build_clusters(rows, matches_path, max_shown=MAX_CLUSTER_SHOWN):
@@ -78,6 +78,15 @@ def compact_rows(rows, clusters=None):
     clusters = clusters or {}
     out = []
     for r in rows:
+        taken = r.get("taken_at", "")
+        match_taken = r.get("match_taken_at", "")
+        dt_min = None
+        if taken and match_taken:
+            try:
+                dt_min = round(abs(float(_epoch(taken))
+                                   - float(_epoch(match_taken))) / 60.0, 1)
+            except ValueError:
+                dt_min = None
         out.append([
             r["asset_id"], r["file_name"],
             round(float(r["latitude"]), 6), round(float(r["longitude"]), 6),
@@ -86,8 +95,16 @@ def compact_rows(rows, clusters=None):
             int(r["n_matches"]), int(float(r["spread_m"])),
             r["status"], r["maps_url"], r["immich_url"],
             clusters.get(r["asset_id"], []),
+            taken, match_taken, dt_min,
         ])
     return out
+
+
+def _epoch(fmt):
+    """'YYYY-MM-DD HH:MM' (UTC) -> epoch seconds."""
+    from datetime import datetime, timezone
+    return datetime.strptime(fmt, "%Y-%m-%d %H:%M").replace(
+        tzinfo=timezone.utc).timestamp()
 
 
 def image_ids(rows, clusters=None):
@@ -182,10 +199,12 @@ PAGE = """<!DOCTYPE html>
 <header>
  <h1>Cluster fill — review</h1>
  <p id="summary"></p>
- <p>Green = already applied to Immich. Orange = proposal only. Each card shows
- the photo, its best match, and the cluster of similar located photos that
- voted (green border = agrees within 100 m). Tick the good proposals and copy
- their asset IDs to send back for approval.</p>
+ <p>Green = already applied to Immich. Orange = proposal (photo and match taken
+ within 10 minutes of each other). Gray = rejected: visually similar but taken
+ too far apart in time. Each card shows the photo, its best match, and the
+ cluster of similar located photos that voted (green border = agrees within
+ 100 m). Tick the good proposals and copy their asset IDs to send back for
+ approval.</p>
 </header>
 <div class="bar">
  <label>Status
@@ -193,6 +212,7 @@ PAGE = """<!DOCTYPE html>
    <option value="all">all</option>
    <option value="review" selected>proposals</option>
    <option value="applied">applied</option>
+   <option value="rejected">rejected (time)</option>
   </select></label>
  <label>Min similarity <span id="simVal">0.90</span>
   <input type="range" id="fSim" min="0.80" max="1.00" step="0.01" value="0.90"></label>
@@ -210,8 +230,10 @@ PAGE = """<!DOCTYPE html>
 <div id="selbar"><span id="selcount"></span><button id="copyBtn">Copy selected IDs</button></div>
 <script>
 const ROWS = {rows};
-const STATUS_COLOR = {{"applied": "#30d158", "review": "#ff9f0a"}};
-const STATUS_LABEL = {{"applied": "applied", "review": "proposal"}};
+const STATUS_COLOR = {{"applied": "#30d158", "review": "#ff9f0a",
+                       "rejected": "#8e8e93"}};
+const STATUS_LABEL = {{"applied": "applied", "review": "proposal",
+                       "rejected": "rejected (time window)"}};
 let selected = new Set();
 
 function esc(s) {{
@@ -219,8 +241,13 @@ function esc(s) {{
 }}
 
 function card(r) {{
-  const [aid, name, lat, lon, sim, mid, mname, n, spread, status, maps, immich, cluster] = r;
+  const [aid, name, lat, lon, sim, mid, mname, n, spread, status, maps, immich,
+         cluster, taken, matchTaken, dtMin] = r;
   const checked = selected.has(aid) ? "checked" : "";
+  const dt = dtMin === null ? "" :
+    `<p>Δt ${{dtMin < 90 ? dtMin.toFixed(0) + " min" :
+                (dtMin / 60).toFixed(1) + " h"}}
+       &middot; taken ${{taken}} vs match ${{matchTaken}} (UTC)</p>`;
   const strip = cluster.map(m =>
     `<div class="thumb ${{m[3] ? "agree" : ""}}" title="${{esc(m[1])}} (sim ${{m[2]}})${{m[3] ? " - agrees" : ""}}">
        <img loading="lazy" src="images/${{m[0]}}.jpg"
@@ -241,6 +268,7 @@ function card(r) {{
       <h2>similarity ${{sim.toFixed(2)}} &middot; ${{n}} agreeing &middot; spread ${{spread}} m</h2>
       <p class="file">${{esc(name)}} &middot; matched ${{esc(mname)}}</p>
       <p>${{lat.toFixed(5)}}, ${{lon.toFixed(5)}}</p>
+      ${{dt}}
       <p><span class="badge" style="background:${{STATUS_COLOR[status]}}">${{STATUS_LABEL[status]}}</span></p>
       <p><a href="${{maps}}" target="_blank">Google Maps</a> &middot;
          <a href="${{immich}}" target="_blank">Open in Immich</a></p>
@@ -296,7 +324,8 @@ document.getElementById("copyBtn").onclick = () => {{
 }};
 document.getElementById("summary").textContent =
   `${{ROWS.filter(r => r[9] === "applied").length}} applied, ` +
-  `${{ROWS.filter(r => r[9] === "review").length}} proposals for review.`;
+  `${{ROWS.filter(r => r[9] === "review").length}} proposals for review, ` +
+  `${{ROWS.filter(r => r[9] === "rejected").length}} rejected (outside the time window).`;
 applyFilters();
 </script>
 </body></html>"""
