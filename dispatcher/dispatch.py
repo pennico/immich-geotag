@@ -590,9 +590,10 @@ def budget_read():
 
     The counter file is shared by all repos' dispatchers (one subscription,
     one budget) and lives outside the repos, next to .publish-flags. A
-    missing, unreadable or corrupt file must never block a tick: start at
-    zero — including a valid-JSON entry whose count is not an integer
-    (null, string), which would otherwise crash every tick.
+    missing or unreadable file must never block a tick: start at zero.
+    A valid-JSON file whose `sessions` value has the wrong type (null,
+    object, ...) is the same corruption: reset it to 0 here so neither
+    budget_spent() nor budget_reserve() can crash on it.
     """
     today = time.strftime("%Y-%m-%d")
     try:
@@ -604,83 +605,60 @@ def budget_read():
             entry = {}
     except (OSError, ValueError):
         entry = {}
-    sessions = entry.get("sessions", 0)
-    if isinstance(sessions, bool) or not isinstance(sessions, int):
-        sessions = 0
-    entry["sessions"] = sessions
+    sessions = entry.get("sessions")
+    if not isinstance(sessions, int) or isinstance(sessions, bool):
+        entry["sessions"] = 0
     return today, entry
 
 
 def budget_spent():
     """True when today's shared session count reached the daily limit.
 
-    Cheap unlocked read for the tick-top check; the authoritative
-    check-and-increment runs under the inter-process lock in
-    budget_reserve().
+    Cheap unlocked read for the tick gate; the authoritative check is
+    the locked budget_reserve() at launch time.
     """
     if DAILY_SESSIONS <= 0:
         return False
     _, entry = budget_read()
-    return entry["sessions"] >= DAILY_SESSIONS
-
-
-def budget_lock():
-    """Open and exclusively lock the shared budget lock file, or None.
-
-    The counter is shared by every repo's dispatcher but the per-repo
-    .lock does not serialize them, so the read-check-increment needs its
-    own inter-process lock. Blocking is fine: the critical section is a
-    file read/write and the kernel releases the lock if the holder dies.
-    A locking problem must never block a tick: count nothing and let the
-    session run.
-    """
-    try:
-        BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(BUDGET_FILE.parent / (BUDGET_FILE.name + ".lock"), "a+")
-    except OSError as e:
-        log(f"could not open session budget lock: {e}")
-        return None
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-    except OSError as e:
-        log(f"could not lock session budget: {e}")
-        fh.close()
-        return None
-    return fh
+    return int(entry.get("sessions", 0)) >= DAILY_SESSIONS
 
 
 def budget_reserve():
-    """Atomically check-and-increment the shared daily counter; returns
-    (ok, just_spent). ok=False: the budget is spent, nothing was counted
-    and the session must not launch. just_spent: this launch filled the
-    budget and the owner is notified once. Best-effort, like the old
-    increment-after-launch: a lock or write failure counts nothing and
-    lets the session run.
+    """Check the shared daily budget and count one launch, atomically.
+
+    Returns True when the session may launch (its slot counted), False
+    when today's budget is spent. The whole check-count-write runs
+    under an exclusive flock on a lock file next to the counter: the
+    counter is shared by all repos' dispatchers, and an unlocked
+    read-modify-write loses updates — concurrent repos could each pass
+    the check and overshoot the cap, and the one-time `notified` flag
+    can be lost. A missing or unwritable counter never blocks a tick:
+    fail open, like budget_read.
     """
     if DAILY_SESSIONS <= 0:
-        return True, False
-    fh = budget_lock()
-    if fh is None:
-        return True, False
+        return True
     just_spent = False
     try:
-        today, entry = budget_read()
-        if entry["sessions"] >= DAILY_SESSIONS:
-            return False, False
-        entry["sessions"] += 1
-        just_spent = (entry["sessions"] >= DAILY_SESSIONS
-                      and not entry.get("notified"))
-        if just_spent:
-            entry["notified"] = True
-        try:
-            BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
-                                              sort_keys=True) + "\n")
-        except OSError as e:
-            log(f"could not update session budget: {e}")
-            just_spent = False
-    finally:
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
+        BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BUDGET_FILE.parent / (BUDGET_FILE.name + ".lock"),
+                  "w") as lockfh:
+            fcntl.flock(lockfh, fcntl.LOCK_EX)
+            try:
+                today, entry = budget_read()
+                if int(entry.get("sessions", 0)) >= DAILY_SESSIONS:
+                    return False
+                entry["sessions"] = int(entry.get("sessions", 0)) + 1
+                just_spent = (entry["sessions"] >= DAILY_SESSIONS
+                              and not entry.get("notified"))
+                if just_spent:
+                    entry["notified"] = True
+                BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
+                                                  sort_keys=True) + "\n")
+            finally:
+                fcntl.flock(lockfh, fcntl.LOCK_UN)
+    except OSError as e:
+        log(f"could not update session budget: {e}")
+        return True
     if just_spent:
         notify.notify("agent loop: daily session budget spent",
                       f"{entry['sessions']}/{DAILY_SESSIONS} headless "
@@ -689,30 +667,35 @@ def budget_reserve():
                       "the loop resumes tomorrow. No action needed — tune "
                       "DISPATCH_DAILY_SESSIONS if this is too tight.",
                       tags="warning")
-    return True, just_spent
+    return True
 
 
 def budget_release():
-    """Give back one reserved session (the launch never happened, e.g.
-    the vibe binary is missing) so the shared day is not undercounted;
-    best-effort, never fatal."""
+    """Give back a slot taken by budget_reserve() when the launch never
+    started (vibe missing): a launch that never runs must not burn the
+    shared daily budget — otherwise every tick spends one more slot and
+    the "budget spent" notification masks the real failure. Same lock
+    as budget_reserve(); a stale `notified` flag is cleared when the
+    count drops back below the cap so a real crossing still notifies.
+    """
     if DAILY_SESSIONS <= 0:
         return
-    fh = budget_lock()
-    if fh is None:
-        return
     try:
-        today, entry = budget_read()
-        if entry["sessions"] > 0:
-            entry["sessions"] -= 1
+        BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BUDGET_FILE.parent / (BUDGET_FILE.name + ".lock"),
+                  "w") as lockfh:
+            fcntl.flock(lockfh, fcntl.LOCK_EX)
             try:
+                today, entry = budget_read()
+                entry["sessions"] = max(0, entry.get("sessions", 0) - 1)
+                if entry["sessions"] < DAILY_SESSIONS:
+                    entry.pop("notified", None)
                 BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
                                                   sort_keys=True) + "\n")
-            except OSError as e:
-                log(f"could not update session budget: {e}")
-    finally:
-        fcntl.flock(fh, fcntl.LOCK_UN)
-        fh.close()
+            finally:
+                fcntl.flock(lockfh, fcntl.LOCK_UN)
+    except OSError as e:
+        log(f"could not update session budget: {e}")
 
 
 def enter_quota_pause(state):
@@ -746,16 +729,18 @@ def run_session(role, prompt):
     missing. Raises Shutdown if SIGTERM arrived (before or during the
     session).
 
-    The shared daily budget is checked and incremented here — the one
-    choke point every role and repo goes through. Reviews and
-    verifications run with a lower turn cap than implementation sessions
-    (their conversations rarely need the full tail).
+    The shared daily budget is checked and counted here — the one
+    choke point every role and repo goes through, atomically under the
+    shared counter's lock. A reserved slot whose launch never started
+    (vibe missing) is given back: a launch that never runs must not
+    burn the shared daily budget. Reviews and verifications run with a
+    lower turn cap than implementation sessions (their conversations
+    rarely need the full tail).
     """
     global _session_proc
     if _shutdown["requested"]:
         raise Shutdown()
-    ok, _ = budget_reserve()
-    if not ok:
+    if not budget_reserve():
         log(f"daily session budget spent; not launching {role} session")
         return SessionResult(None, budget=True)
     LOGDIR.mkdir(exist_ok=True)
@@ -970,10 +955,10 @@ def tick(dry):
         run(["gh", "issue", "edit", str(issue["number"]), "--remove-label", "answered"])
         state["resumed_blockers"].append(issue["number"])
         state["verified_idle"] = False  # new work: re-verify before idle again
+        state["failures"] = {}  # fresh failure budget after owner input
         state["ci_fix_tried"] = []     # fresh CI-fix budget too
         state["ci_escalated"] = []
         state["main_ci_strikes"] = 0   # fresh main-CI budget as well
-        state["failures"] = {}  # fresh failure budget after owner input
         maybe_save(state, dry)
         note = STASH_NOTE if state.get("stash_note_pending") else ""
         res = run_session("impl", RESUME_PROMPT.format(
@@ -1235,6 +1220,8 @@ def tick(dry):
                 state["qa_strikes"].pop(str(p["number"]), None)
                 state["approved_prs"] = [n for n in state["approved_prs"]
                                          if n != p["number"]]
+                state["ci_failed_prs"] = [n for n in state.get("ci_failed_prs", [])
+                                          if n != p["number"]]
                 notify.notify(f"{REPO_NAME}: PR merged",
                               f"#{p['number']} {p['title']}\n\n"
                               "Outputs will be published to Nextcloud "
