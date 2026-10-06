@@ -36,13 +36,26 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
   7. Else: idle (roadmap complete) -> notify once.
 
 Delivery verification: when the loop considers the delivery complete —
-after a PR merges, and once when a repo goes idle — a verification
-session asks: "Has the project fulfilled its scope and are all the
-deliverables completed, and stored correctly?" Gaps are filed as
-`[verify]` task issues the loop picks up next tick; a clean pass notifies
-the owner. An approved PR whose CI stays red gets one automatic fix
-session (the fix re-enters the review pipeline) before the dispatcher
-escalates to a blocker.
+once per idle period (per-merge verification is available behind
+DISPATCH_VERIFY_PER_MERGE, default off) — a verification session asks:
+"Has the project fulfilled its scope and are all the deliverables
+completed, and stored correctly?" Gaps are filed as `[verify]` task
+issues the loop picks up next tick; a clean pass notifies the owner.
+An approved PR whose CI stays red gets one automatic fix session (the
+fix re-enters the review pipeline) before the dispatcher escalates to
+a blocker.
+
+Cost controls: every session launch checks and increments a shared
+daily counter (<projects>/.session-budget.json, one budget for all
+repos; DISPATCH_DAILY_SESSIONS, default 14). When it is spent, no
+sessions launch for the rest of the day and the owner is notified
+once; ticks stay cheap. A session that dies on an API-limit signature
+(HTTP 402/429, quota, rate limit, ...) is not a real failure: no
+strike, no rework, no blocker — the repo pauses for a cooldown
+(state.json `quota_pause_until`, DISPATCH_QUOTA_COOLDOWN_S, default
+6h) and retries automatically. Implementation sessions run with
+--max-turns 150; qa/adv/verify sessions with DISPATCH_MAX_TURNS_REVIEW
+(default 60).
 
 Failure budget: dispatcher/state.json counts consecutive failed sessions
 (non-zero exit or timeout) per roadmap item. 2 strikes on the same item ->
@@ -50,8 +63,9 @@ the dispatcher files a blocker issue and pauses the repo; the owner's
 answer on that issue resumes the loop with a fresh budget.
 
 Sessions run: vibe -p <prompt> --auto-approve --trust --max-turns 150
---max-price $DISPATCH_MAX_PRICE (default 10) --output json, 90-minute
-timeout, output captured to dispatcher/logs/.
+(impl/arch) or 60 (qa/adv/verify) --max-price $DISPATCH_MAX_PRICE
+(default 10) --output json, 90-minute timeout, output captured to
+dispatcher/logs/.
 
 Gentle shutdown: on SIGTERM (container stop, reboot) the running session
 is terminated, its uncommitted work is stashed, and the loop exits 0.
@@ -89,7 +103,14 @@ LOGDIR = REPO / "dispatcher" / "logs"
 STATE_FILE = REPO / "dispatcher" / "state.json"
 LOCK_FILE = REPO / "dispatcher" / ".lock"
 PUBLISH_FLAGS = REPO.parent / ".publish-flags"
+BUDGET_FILE = REPO.parent / ".session-budget.json"
 MAX_TURNS = "150"
+MAX_TURNS_REVIEW = os.environ.get("DISPATCH_MAX_TURNS_REVIEW", "60")
+DAILY_SESSIONS = int(os.environ.get("DISPATCH_DAILY_SESSIONS", "14"))
+QUOTA_COOLDOWN_S = int(os.environ.get("DISPATCH_QUOTA_COOLDOWN_S",
+                                      str(6 * 3600)))
+VERIFY_PER_MERGE = os.environ.get("DISPATCH_VERIFY_PER_MERGE", "").lower() \
+    not in ("", "0", "false", "no")
 MAX_PRICE = os.environ.get("DISPATCH_MAX_PRICE", "10")
 SESSION_TIMEOUT_S = 5400
 FAIL_STRIKES = 2   # failed sessions per roadmap item before pausing
@@ -476,20 +497,140 @@ def recover_dirty_tree():
     return stashed or bool(branches)
 
 
-def run_session(role, prompt):
-    """Returns the session exit code, 124 on timeout, None if vibe is missing.
+class SessionResult:
+    """Outcome of one session launch attempt.
 
-    Raises Shutdown if SIGTERM arrived (before or during the session).
+    code: the vibe exit code (124 on timeout), None if vibe never started.
+    quota: the failure carries an API-limit signature (issue #15) — not a
+        real failure; the loop pauses instead of burning failure budgets.
+    budget: the shared daily session budget was spent; nothing launched.
+    """
+
+    def __init__(self, code, quota=False, budget=False):
+        self.code = code
+        self.quota = quota
+        self.budget = budget
+
+
+# API-limit signatures in a dying session's output (case-insensitive).
+# A session that exits non-zero carrying one of these hit the Mistral
+# subscription limit, not a real failure (issue #15).
+QUOTA_SIG = re.compile(r"402|429|quota|rate[ _-]?limit|insufficient|"
+                       r"payment required|balance|credit|exceeded",
+                       re.IGNORECASE)
+
+
+def is_quota_failure(code, output):
+    """True when a non-zero session exit carries an API-limit signature."""
+    if code in (0, 124, None):
+        return False
+    return bool(QUOTA_SIG.search(output))
+
+
+def budget_read():
+    """(today, entry) from the shared counter; corrupt/missing -> fresh.
+
+    The counter file is shared by all repos' dispatchers (one subscription,
+    one budget) and lives outside the repos, next to .publish-flags. A
+    missing or unreadable file must never block a tick: start at zero.
+    """
+    today = time.strftime("%Y-%m-%d")
+    try:
+        data = json.loads(BUDGET_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        entry = data.get(today)
+        if not isinstance(entry, dict):
+            entry = {}
+    except (OSError, ValueError):
+        entry = {}
+    return today, entry
+
+
+def budget_spent():
+    """True when today's shared session count reached the daily limit."""
+    if DAILY_SESSIONS <= 0:
+        return False
+    _, entry = budget_read()
+    return int(entry.get("sessions", 0)) >= DAILY_SESSIONS
+
+
+def budget_increment():
+    """Count one session launch; notify the owner once when spent."""
+    if DAILY_SESSIONS <= 0:
+        return
+    today, entry = budget_read()
+    entry["sessions"] = int(entry.get("sessions", 0)) + 1
+    just_spent = (entry["sessions"] >= DAILY_SESSIONS
+                  and not entry.get("notified"))
+    if just_spent:
+        entry["notified"] = True
+    try:
+        BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
+                                          sort_keys=True) + "\n")
+    except OSError as e:
+        log(f"could not update session budget: {e}")
+        return
+    if just_spent:
+        notify.notify("agent loop: daily session budget spent",
+                      f"{entry['sessions']}/{DAILY_SESSIONS} headless "
+                      "sessions have run today across all repos (the "
+                      "budget is shared). No more sessions launch today; "
+                      "the loop resumes tomorrow. No action needed — tune "
+                      "DISPATCH_DAILY_SESSIONS if this is too tight.",
+                      tags="warning")
+
+
+def enter_quota_pause(state):
+    """Set the API-quota cooldown in state.json; notify the owner once."""
+    if state.get("quota_pause_until", 0) > time.time():
+        return  # already paused: one notification per episode
+    until = time.time() + QUOTA_COOLDOWN_S
+    state["quota_pause_until"] = until
+    resume = datetime.fromtimestamp(until).strftime("%H:%M")
+    log(f"API quota/limit exhausted; sessions paused until {resume}")
+    notify.notify(f"{REPO_NAME}: paused — API quota/limit exhausted",
+                  f"A session died on an API limit (HTTP 402/429 or "
+                  f"similar). No sessions launch until {resume}, then the "
+                  "loop retries automatically. No action needed.",
+                  tags="warning")
+
+
+def pause_for_quota_or_budget(state, res, dry):
+    """A session could not run (API-limit signature or spent daily
+    budget): pause the repo without counting a failure. Returns
+    'blocked' — the next ticks stay cheap until the cooldown expires or
+    the day rolls over."""
+    if res.quota:
+        enter_quota_pause(state)
+    maybe_save(state, dry)
+    return "blocked"
+
+
+def run_session(role, prompt):
+    """Launch one vibe session; returns a SessionResult, None if vibe is
+    missing. Raises Shutdown if SIGTERM arrived (before or during the
+    session).
+
+    The shared daily budget is checked and incremented here — the one
+    choke point every role and repo goes through. Reviews and
+    verifications run with a lower turn cap than implementation sessions
+    (their conversations rarely need the full tail).
     """
     global _session_proc
     if _shutdown["requested"]:
         raise Shutdown()
+    if budget_spent():
+        log(f"daily session budget spent; not launching {role} session")
+        return SessionResult(None, budget=True)
     LOGDIR.mkdir(exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     logfile = LOGDIR / f"{ts}-{role}.json"
     log(f"starting {role} session (log: {logfile.name})")
+    max_turns = MAX_TURNS if role in ("impl", "arch") else MAX_TURNS_REVIEW
     cmd = ["vibe", "-p", prompt, "--auto-approve", "--trust",
-           "--max-turns", MAX_TURNS, "--max-price", MAX_PRICE,
+           "--max-turns", max_turns, "--max-price", MAX_PRICE,
            "--output", "json"]
     try:
         proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE,
@@ -497,6 +638,7 @@ def run_session(role, prompt):
     except FileNotFoundError:
         log("ABORT: vibe CLI not found on PATH")
         return None
+    budget_increment()
     _session_proc = proc
     try:
         stdout, stderr = proc.communicate(timeout=SESSION_TIMEOUT_S)
@@ -506,17 +648,19 @@ def run_session(role, prompt):
         proc.communicate()
         (LOGDIR / f"{ts}-{role}.exit").write_text("timeout\n")
         log(f"{role} session timed out after {SESSION_TIMEOUT_S}s")
-        return 124
+        return SessionResult(124)
     finally:
         _session_proc = None
     logfile.write_text(stdout or "")
     if code != 0 and (stderr or "").strip():
         (LOGDIR / f"{ts}-{role}.err").write_text(stderr)
     (LOGDIR / f"{ts}-{role}.exit").write_text(str(code) + "\n")
-    log(f"{role} session finished, exit {code}")
+    quota = is_quota_failure(code, (stderr or "") + "\n" + (stdout or ""))
+    log(f"{role} session finished, exit {code}"
+        + (" (API quota/limit signature)" if quota else ""))
     if _shutdown["requested"]:
         raise Shutdown()
-    return code
+    return SessionResult(code, quota=quota)
 
 
 def request_publish():
@@ -555,7 +699,7 @@ def report_session_failure(source, title):
                    f"{source} session failed: {title}", tail or "(no output)")
 
 
-def verify_delivery(delivered, dry):
+def verify_delivery(delivered, dry, state):
     """Run the delivery-verification session and report the verdict.
 
     Asks the verification question ("has the project fulfilled its scope
@@ -563,16 +707,27 @@ def verify_delivery(delivered, dry):
     session. The session files a `[verify]` task issue for gaps (the
     loop picks it up next tick); silence means pass. Never blocks the
     tick: a failed session is fed to the feedback loop, not the budget.
+
+    Returns True when a session actually ran (a verdict was attempted),
+    False when it could not run (API quota, spent budget, missing vibe)
+    — the caller keeps its verification flag so it retries later.
     """
     if dry:
         log(f"would run delivery verification: {delivered}")
-        return
+        return True
     before = {i["number"] for i in task_issues()}
-    code = run_session("verify", VERIFY_PROMPT.format(delivered=delivered))
-    if code is None or code != 0:
-        log(f"verification session failed (exit {code}); no verdict")
+    res = run_session("verify", VERIFY_PROMPT.format(delivered=delivered))
+    if res is None:
+        log("verification session could not start (vibe missing)")
+        return False
+    if res.quota or res.budget:
+        if res.quota:
+            enter_quota_pause(state)
+        return False
+    if res.code != 0:
+        log(f"verification session failed (exit {res.code}); no verdict")
         report_session_failure("verify", delivered)
-        return
+        return True
     gaps = [i for i in task_issues() if i["number"] not in before]
     if gaps:
         log(f"delivery verification found gaps: {[i['title'] for i in gaps]}")
@@ -587,6 +742,7 @@ def verify_delivery(delivered, dry):
                       "Scope fulfilled; deliverables complete and stored "
                       "correctly. No action needed.",
                       tags="ok")
+    return True
 
 
 def tick(dry):
@@ -652,6 +808,15 @@ def tick(dry):
             "waiting for the owner")
         maybe_save(state, dry)
         return "blocked"
+    # --- session-launch pauses: API-quota cooldown, daily budget ---
+    # While either is active no session launches at all; the tick stays
+    # cheap (git pull + gh queries + blocker notifications only).
+    if state.get("quota_pause_until", 0) > time.time() or budget_spent():
+        reason = ("API quota cooldown" if state.get("quota_pause_until", 0)
+                  > time.time() else "daily session budget spent")
+        log(f"sessions paused ({reason}); cheap tick, no launches")
+        maybe_save(state, dry)
+        return "blocked"
     if actionable:
         issue = actionable[0]
         if dry:
@@ -671,11 +836,13 @@ def tick(dry):
         state["failures"] = {}  # fresh failure budget after owner input
         maybe_save(state, dry)
         note = STASH_NOTE if state.get("stash_note_pending") else ""
-        code = run_session("impl", RESUME_PROMPT.format(
+        res = run_session("impl", RESUME_PROMPT.format(
             number=issue["number"], title=issue["title"], answer=answer) + note)
-        if code is None:
+        if res is None:
             return "abort"
-        if code == 0:
+        if res.quota or res.budget:
+            return pause_for_quota_or_budget(state, res, dry)
+        if res.code == 0:
             state.pop("stash_note_pending", None)
             request_publish()
             maybe_save(state, dry)
@@ -738,11 +905,16 @@ def tick(dry):
                                   "The dispatcher is trying to fix it; "
                                   "you'll be notified again only if it "
                                   "cannot.", tags="warning")
-                    code = run_session("impl", MAIN_CI_FIX_PROMPT.format(
+                    res = run_session("impl", MAIN_CI_FIX_PROMPT.format(
                         run_id=rid, title=r.get("displayTitle", "")))
-                    if code is None:
+                    if res is None:
                         return "abort"
-                    if code == 0:
+                    if res.quota or res.budget:
+                        # the fix session never ran; do not burn a strike
+                        state["main_ci_fixed_runs"].remove(rid)
+                        state["main_ci_strikes"] -= 1
+                        return pause_for_quota_or_budget(state, res, dry)
+                    if res.code == 0:
                         request_publish()
                     maybe_save(state, dry)
                     return "worked"
@@ -778,19 +950,22 @@ def tick(dry):
                       "No action needed — next update when a PR opens.",
                       tags="rocket", url=issue.get("url"))
         note = STASH_NOTE if state.get("stash_note_pending") else ""
-        code = run_session("impl", TASK_PROMPT.format(
+        res = run_session("impl", TASK_PROMPT.format(
             number=n, title=issue["title"], body=body, comments=ctext) + note)
-        if code is None:
+        if res is None:
             return "abort"
+        if res.quota or res.budget:
+            state["launched_tasks"].remove(n)  # retry after the pause
+            return pause_for_quota_or_budget(state, res, dry)
         key = f"task #{n}"
-        if code == 0:
+        if res.code == 0:
             state["failures"].pop(key, None)
             state.pop("stash_note_pending", None)
             request_publish()
         else:
             fails = state["failures"].get(key, 0) + 1
             state["failures"][key] = fails
-            log(f"task session failed (exit {code}); failures: {fails}")
+            log(f"task session failed (exit {res.code}); failures: {fails}")
             if fails < FAIL_STRIKES:
                 # Feed the failure back: a diagnosis task issue gives the
                 # loop one self-fix attempt before human escalation.
@@ -869,8 +1044,13 @@ def tick(dry):
                     if dry:
                         log(f"would run CI fix session for PR #{p['number']}")
                     else:
-                        run_session("impl", CI_FIX_PROMPT.format(
+                        res = run_session("impl", CI_FIX_PROMPT.format(
                             number=p["number"], title=p["title"]))
+                        if res is not None and (res.quota or res.budget):
+                            # the fix session never ran; do not burn the
+                            # one-shot budget or invalidate approvals
+                            state["ci_fix_tried"].remove(p["number"])
+                            return pause_for_quota_or_budget(state, res, dry)
                         # The fix pushed new code: re-verify correctness
                         # before it can merge (same rule as rework).
                         run(["gh", "pr", "edit", str(p["number"]),
@@ -921,14 +1101,17 @@ def tick(dry):
                               "Documents/04_projects/ within ~5 min. "
                               "No action needed.",
                               tags="white_check_mark", url=p.get("url"))
-                # Delivery complete for this PR: verify scope + storage.
-                if p["number"] not in state["verified_merges"]:
+                # Merged work: re-verify before the repo goes idle again.
+                state["verified_idle"] = False
+                # Per-merge verification is off by default (cost control,
+                # issue #16): the once-per-idle verification covers it.
+                # Set DISPATCH_VERIFY_PER_MERGE=1 to restore it.
+                if VERIFY_PER_MERGE and p["number"] not in state["verified_merges"]:
                     state["verified_merges"].append(p["number"])
-                    state["verified_idle"] = False
                     maybe_save(state, dry)
                     verify_delivery(
                         f"PR #{p['number']} ({p['title']}) just merged to main",
-                        dry)
+                        dry, state)
             else:
                 waiting = True
                 if p["number"] not in state["merge_failed_prs"]:
@@ -957,9 +1140,13 @@ def tick(dry):
                 maybe_save(state, dry)
                 return "worked"
             maybe_save(state, dry)
-            code = run_session(role, prompt)
-            if code is None:
+            res = run_session(role, prompt)
+            if res is None:
                 return "abort"
+            if res.quota or res.budget:
+                # a quota death is not a failed review: no strikes, no
+                # rework, no blocker — pause and retry after the cooldown
+                return pause_for_quota_or_budget(state, res, dry)
             pause = False
             for p in targets:
                 n = p["number"]
@@ -992,8 +1179,13 @@ def tick(dry):
                     pause = True
                     continue
                 log(f"PR #{n} failed {role} review (strike {strikes}); launching rework")
-                run_session("impl", REWORK_PROMPT.format(
+                res = run_session("impl", REWORK_PROMPT.format(
                     number=n, title=p["title"]))
+                if res is not None and (res.quota or res.budget):
+                    # rework could not run: undo this round's strike (the
+                    # round restarts after the pause) and stop the tick
+                    state["qa_strikes"][str(n)] = strikes - 1
+                    return pause_for_quota_or_budget(state, res, dry)
                 if "approved" in after:
                     run(["gh", "pr", "edit", str(n), "--remove-label", "approved"])
                     log(f"PR #{n}: removed `approved` (code changed in rework)")
@@ -1035,17 +1227,19 @@ def tick(dry):
             return "worked"
         maybe_save(state, dry)
         note = STASH_NOTE if state.get("stash_note_pending") else ""
-        code = run_session(role, PROMPTS[role].format(item=item) + note)
-        if code is None:
+        res = run_session(role, PROMPTS[role].format(item=item) + note)
+        if res is None:
             return "abort"
-        if code == 0:
+        if res.quota or res.budget:
+            return pause_for_quota_or_budget(state, res, dry)
+        if res.code == 0:
             state["failures"].pop(item, None)
             state.pop("stash_note_pending", None)
             request_publish()
         else:
             fails = state["failures"].get(item, 0) + 1
             state["failures"][item] = fails
-            log(f"session failed (exit {code}); failures for this item: {fails}")
+            log(f"session failed (exit {res.code}); failures for this item: {fails}")
             if fails < FAIL_STRIKES:
                 # Feed the failure back: a diagnosis task issue gives the
                 # loop one self-fix attempt before human escalation.
@@ -1086,9 +1280,11 @@ def tick(dry):
     if not state.get("verified_idle"):
         state["verified_idle"] = True
         maybe_save(state, dry)
-        verify_delivery(
-            "the roadmap is complete, all PRs are merged, and the repo is idle",
-            dry)
+        if not verify_delivery(
+                "the roadmap is complete, all PRs are merged, and the repo is idle",
+                dry, state):
+            state["verified_idle"] = False  # session did not run; retry later
+            maybe_save(state, dry)
     maybe_save(state, dry)
     return "idle"
 

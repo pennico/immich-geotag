@@ -17,10 +17,9 @@ anyone launching sessions manually.
 4. No PRs -> Implementation session on the first unchecked ROADMAP.md item
    (every chunk is an [impl] session).
 5. Roadmap complete -> idle + one "roadmap done" notification.
-6. Delivery verification: when the loop considers the delivery complete
-   (a PR merged, and once per idle period), a verification session asks
-   "Has the project fulfilled its scope and are all the deliverables
-   completed, and stored correctly?" — gaps come back as `[verify]` task
+6. Delivery verification: once per idle period, a verification session
+   asks "Has the project fulfilled its scope and are all the
+   deliverables completed, and stored correctly?" — gaps come back as `[verify]` task
    issues the loop schedules fixes for; a clean pass notifies the owner.
    An approved PR with red CI gets one automatic fix session (the fix
    re-enters the review pipeline) before the dispatcher escalates to a
@@ -53,21 +52,31 @@ budget hit (high), roadmap done (high), PR opened/approved/merged
 (default). Failures to send are logged, never fatal — GitHub issues are
 the durable record.
 
-## Cost cap
+## Cost controls
 
-Sessions run with `--max-price $DISPATCH_MAX_PRICE` (default 10) plus
-`--max-turns 150` and a 90-minute timeout. The cap is a runaway guard, not
-a budget target; after the first supervised runs, calibrate it to roughly
-2x the observed cost of a normal session (token usage is in the session
-JSON logs).
+- Sessions run with `--max-price $DISPATCH_MAX_PRICE` (default 10) plus a
+  90-minute timeout. The cap is a runaway guard, not a budget target;
+  after the first supervised runs, calibrate it to roughly 2x the
+  observed cost of a normal session (token usage is in the session
+  JSON logs).
+- Implementation sessions run `--max-turns 150`; qa/adversarial/verify
+  sessions run `--max-turns $DISPATCH_MAX_TURNS_REVIEW` (default 60).
+- Every session launch checks and increments a shared daily counter
+  (`<projects>/.session-budget.json`, all repos, one budget). At
+  `DISPATCH_DAILY_SESSIONS` (default 14) no sessions launch for the rest
+  of the day; the owner is notified once.
+- A session that dies on an API-limit signature (HTTP 402/429, quota,
+  rate limit, ...) is not a real failure: no strike, no rework, no
+  blocker — the repo pauses for `DISPATCH_QUOTA_COOLDOWN_S` (default
+  6h) and retries automatically.
 
 ## Guardrails
 
 - `.vibe/hooks.toml` + `.vibe/guard.py` deny destructive bash commands
   (force-push, reset --hard, rm -rf, sudo, pipe-to-shell) and any agent
   access to `.env`. Loaded because the dispatcher passes `--trust`.
-- Sessions run with `--auto-approve --max-turns 150 --max-price ...` and a
-  90-minute timeout; output is captured, never interactive.
+- Sessions run with `--auto-approve --max-turns ... --max-price ...` and
+  a 90-minute timeout; output is captured, never interactive.
 - The dispatcher never force-pushes, never merges unapproved PRs, and
   aborts on a dirty tree.
 
