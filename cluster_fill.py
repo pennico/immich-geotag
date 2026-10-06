@@ -423,7 +423,8 @@ def run(matches_path, dry_run=False, redo=False, min_sim=0.90,
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("matches", help="match CSV from cluster_matches.sql")
+    p.add_argument("matches", nargs="?", default=None,
+                   help="match CSV from cluster_matches.sql")
     p.add_argument("--dry-run", action="store_true",
                    help="report counts only; write nothing")
     p.add_argument("--redo", action="store_true",
@@ -449,6 +450,8 @@ def main():
     if args.apply_approved:
         apply_approved(dry_run=args.dry_run)
         return
+    if not args.matches:
+        p.error("the matches CSV is required unless --apply-approved")
     run(args.matches, dry_run=args.dry_run, redo=args.redo,
         min_sim=args.min_sim, agree_m=args.agree_m, solo_sim=args.solo_sim,
         max_dt=args.max_dt_min * 60.0)
