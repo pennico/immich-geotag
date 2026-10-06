@@ -21,7 +21,6 @@ out=geotag-data/cluster-review-app (both relative to this script).
 
 import argparse
 import concurrent.futures
-import html
 import json
 import os
 import sys
@@ -72,7 +71,7 @@ def download_images(immich, ids, images_dir, workers=8):
     failed = []
 
     def fetch(asset_id):
-        url = immich._url("/assets/{}/thumbnail?size=thumbnail".format(asset_id))
+        url = immich._url(f"/assets/{asset_id}/thumbnail?size=thumbnail")
         data = geotag.http_bytes("GET", url, headers=immich.headers)
         with open(os.path.join(images_dir, asset_id + ".jpg"), "wb") as f:
             f.write(data)
@@ -275,8 +274,8 @@ def main():
         ids = image_ids(rows)
         ok, failed = download_images(immich, ids,
                                      os.path.join(args.out, "images"))
-        print("thumbnails: {} ok, {} failed, {} skipped".format(
-            ok, len(failed), len(ids) - ok - len(failed)))
+        print(f"thumbnails: {ok} ok, {len(failed)} failed, "
+              f"{len(ids) - ok - len(failed)} skipped")
 
     os.makedirs(args.out, exist_ok=True)
     page = render_page(rows)
