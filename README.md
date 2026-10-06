@@ -34,7 +34,7 @@ cp .env.example .env    # fill in IMMICH_URL, IMMICH_API_KEY, GOOGLE_VISION_API_
 Three commands around one CSV review buffer:
 
 ```bash
-python3 geotag.py scan out.csv          # list missing-GPS images (newest first)
+python3 geotag.py scan --out out.csv     # list missing-GPS images (newest first)
 python3 geotag.py recognize out.csv     # fill coordinates for pending rows
 python3 geotag.py apply out.csv         # write located rows to Immich (idempotent)
 ```
