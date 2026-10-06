@@ -107,8 +107,8 @@ def merge_batch_into_state():
 def write_report(results, processed, located, applied, usage_total):
     """Write this month's markdown report (one per calendar month).
 
-    Published to Nextcloud by the homelab's publish_geotag_outputs.sh
-    so results are readable from the phone over Tailscale.
+    Copy reports/ wherever you like (a sync share, your notes) to read
+    the results from your phone.
     """
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     lines = [
