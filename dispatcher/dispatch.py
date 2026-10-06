@@ -536,6 +536,26 @@ QUOTA_SIG = re.compile(
     r"|\b(?:monthly|daily|weekly|usage|api|request|subscription)\s+limits?\b",
     re.IGNORECASE)
 
+# GitHub's own rate limits (gh CLI, api.github.com) are much shorter-lived
+# than the provider quota and must not trigger the 6-hour pause (blocker
+# #9, owner option 1): a GitHub rate limit is a normal failure — it
+# counts a strike, and two strikes reach the owner through the diagnosis
+# issue. Every signature is anchored to a GitHub-specific marker (gh CLI
+# error prefix, api.github.com, "secondary rate limit", GitHub's abuse
+# detector) so a provider quota death — which never mentions gh/GitHub —
+# still pauses. When both signatures appear in the same tail the GitHub
+# one wins: the safe direction is a strike (which surfaces to the owner
+# after 2 strikes), not a wrong-provider 6-hour pause.
+GITHUB_RATE_SIG = re.compile(
+    r"\bsecondary\s+rate\s+limit\b"
+    r"|\bapi\.github\.com\b[^.\n]{0,120}\brate[ _-]?limits?\b"
+    r"|\brate[ _-]?limits?\b[^.\n]{0,120}\bapi\.github\.com\b"
+    r"|\bgh\b\s*:[^.\n]{0,120}\brate[ _-]?limits?\b"
+    r"|\bgithub\b[^.\n]{0,80}\brate[ _-]?limits?\b"
+    r"|\brate[ _-]?limits?\b[^.\n]{0,80}\bgithub\b"
+    r"|\babuse\s+detection\s+mechanism\b",
+    re.IGNORECASE)
+
 # Only this many final characters of the CLI's error output are scanned
 # for a quota signature: the signature must come from the session's dying
 # moments (a CLI error, a traceback), not from text that merely quoted
@@ -552,10 +572,17 @@ def is_quota_failure(code, output):
     "quota" constantly, and its transcript must not turn a real crash into
     a quota death. A signature that lands outside stderr falls back to
     normal failure handling (strike + diagnosis), the safe direction.
+
+    A GitHub rate limit is never a quota death (blocker #9): the agent
+    sessions run gh constantly and GitHub's limits clear in minutes, so
+    they count a normal strike instead of pausing the repo for hours.
     """
     if code in (0, 124, None):
         return False
-    return bool(QUOTA_SIG.search(output[-OUTPUT_TAIL_S:]))
+    tail = output[-OUTPUT_TAIL_S:]
+    if GITHUB_RATE_SIG.search(tail):
+        return False
+    return bool(QUOTA_SIG.search(tail))
 
 
 def budget_read():

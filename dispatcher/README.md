@@ -68,7 +68,10 @@ the durable record.
 - A session that dies on an API-limit signature (HTTP 402/429, quota,
   rate limit, ...) is not a real failure: no strike, no rework, no
   blocker — the repo pauses for `DISPATCH_QUOTA_COOLDOWN_S` (default
-  6h) and retries automatically.
+  6h) and retries automatically. GitHub's own rate limits (gh CLI,
+  api.github.com) are the exception (issue #9): they clear in minutes,
+  so they count a normal strike — after 2 strikes the diagnosis issue
+  reaches the owner — and never trigger the 6-hour pause.
 
 ## Guardrails
 
