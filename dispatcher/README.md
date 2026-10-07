@@ -40,7 +40,11 @@ anyone launching sessions manually.
 (non-zero exit or timeout) per roadmap item. 2 strikes on the same item ->
 the dispatcher files a blocker issue and pauses the repo; the owner's
 answer on that issue resumes with a fresh budget. QA has the same budget:
-2 QA passes on the same PR without approval -> blocker issue + pause.
+2 failed review rounds on the same PR (reviewer label not added) ->
+blocker issue + pause. Strikes accumulate across BOTH reviewers — a
+passed review does not reset them; only a merge does — and a rework
+that could not run (API-quota pause, spent budget) undoes its round's
+strike, while a completed rework keeps it (pennico-ops #21).
 
 ## Context diet (per-session data pull)
 
@@ -82,7 +86,11 @@ the durable record.
 - Implementation sessions run `--max-turns 150`; qa/adversarial/verify
   sessions run `--max-turns $DISPATCH_MAX_TURNS_REVIEW` (default 60).
 - Every session launch checks and increments a shared daily counter
-  (`<projects>/.session-budget.json`, all repos, one budget). At
+  (`<projects>/.session-budget.json`, all repos, one budget) under an
+  exclusive file lock, written atomically (temp file + rename); a
+  missing or corrupt counter is recreated at zero LOUDLY in the tick
+  log — it is live shared state, never delete or hand-edit it
+  (pennico-ops #21). At
   `DISPATCH_DAILY_SESSIONS` (default 14) no sessions launch for the rest
   of the day; the owner is notified once.
 - A session that dies on an API-limit signature (HTTP 402/429, quota,
