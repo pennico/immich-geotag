@@ -15,21 +15,35 @@ TOPIC = os.environ.get("NTFY_TOPIC", "")
 TOKEN = os.environ.get("NTFY_TOKEN", "")
 PRIORITIES = {"min": "1", "default": "3", "high": "4"}
 
+# HTTP headers are latin-1; titles and tags carry agent prose with
+# em-dashes and curly quotes that would crash the send (2026-10-07:
+# "'latin-1' codec can't encode character '\\u2014'"). Transliterate
+# the common punctuation, replace anything else.
+_ASCII_MAP = {"\u2014": "--", "\u2013": "-", "\u2018": "'",
+              "\u2019": "'", "\u201c": '"', "\u201d": '"',
+              "\u2026": "...", "\u2192": "->", "\u00a0": " "}
+
+
+def _header(value):
+    """Latin-1-safe header value: transliterate, then replace the rest."""
+    out = "".join(_ASCII_MAP.get(ch, ch) for ch in value)
+    return out.encode("latin-1", "replace").decode("latin-1")
+
 
 def notify(title, body, priority="default", tags="", url=""):
     """Send one push notification. Returns True if ntfy accepted it."""
     if not TOPIC:
         return False
     headers = {
-        "X-Title": title,
+        "X-Title": _header(title),
         "X-Priority": PRIORITIES.get(priority, PRIORITIES["default"]),
     }
     if TOKEN:
         headers["Authorization"] = f"Bearer {TOKEN}"
     if tags:
-        headers["X-Tags"] = tags
+        headers["X-Tags"] = _header(tags)
     if url:
-        headers["Actions"] = f"view, Open, {url}"
+        headers["Actions"] = _header(f"view, Open, {url}")
     req = urllib.request.Request(
         f"{SERVER}/{TOPIC}", data=body.encode("utf-8"), headers=headers)
     try:
