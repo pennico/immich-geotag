@@ -10,11 +10,13 @@ scheduled jobs, publish pipeline) live in
 [AGENTIC_WORK_STANDARDS.md](https://github.com/pennico/pennico-ops/blob/main/AGENTIC_WORK_STANDARDS.md)
 in pennico-ops.
 
-`PLAN.md` is the complete, approved spec AND architecture: target design
-(three subcommands, CSV as review buffer), verified API reference, build
-steps 1–7, caveats. Read it first and follow it — do not redesign. The
-only roles needed here are Implementation and QA (spec/architecture are
-done); your session prompt names your role.
+`STATUS.md` is the short current-state file — read it first in every
+session. `PLAN.md` is the complete, approved spec AND architecture:
+target design (three subcommands, CSV as review buffer), verified API
+reference, build steps 1–7, caveats. It is frozen reference material:
+read it in targeted ranges (grep / line ranges), not in full, and do
+not redesign. The only roles needed here are Implementation and QA
+(spec/architecture are done); your session prompt names your role.
 
 ## Work (from PLAN.md build steps, in order)
 
@@ -69,7 +71,8 @@ whole run. When a question is not answered by PLAN.md:
 - Keep the existing CLI behaviors working (`--asset-id`, `--limit`,
   `--min-score`).
 - One PR per coherent chunk (e.g. subcommands+CSV, then recognize/apply,
-  then tests). Update `PLAN.md` with a short "what changed" note per PR.
+  then tests). Update `STATUS.md` in the same PR whenever it changes
+  what is done or in flight (`PLAN.md` stays frozen reference).
 
 ## Live validation (owner only, never the agent)
 
