@@ -1,0 +1,38 @@
+name: Monthly geotag run issue
+
+# GitHub is the only trigger bus (AGENTIC_WORK_STANDARDS.md, "Trigger
+# model"): calendar jobs are scheduled workflows that file `run` issues;
+# the dispatcher executes the command directly (no LLM session) within
+# one tick. Replaces the removed host cron entry
+# (17 4 1 * * geotag-monthly-run.sh).
+
+on:
+  schedule:
+    - cron: "17 4 1 * *"  # 1st of the month, 04:17 UTC
+  workflow_dispatch: {}   # manual trigger from the Actions tab
+
+permissions:
+  issues: write
+
+jobs:
+  file-run-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: File the run issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh label create run --color D4C5F9 2>/dev/null || true
+          if gh issue create --label run \
+             --title "Monthly geotag backfill (auto)" \
+             --body "python3 monthly_geotag.py
+
+          Scheduled by the monthly-geotag-run workflow. The dispatcher
+          runs the command directly (no agent session) and comments the
+          output tail here."; then
+            echo "run issue filed"
+          else
+            echo "could not file the run issue" >&2
+            exit 1
+          fi
