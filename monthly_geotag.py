@@ -31,6 +31,7 @@ Usage:
 Environment (beyond geotag.py's own): GEOTAG_MONTHLY_FREE (default 1000),
 NTFY_SERVER / NTFY_TOPIC / NTFY_TOKEN for the summary notification.
 """
+import argparse
 import csv
 import json
 import os
@@ -155,11 +156,22 @@ def notify(title, body, priority="default"):
         log(f"ntfy notify failed (not fatal): {exc}")
 
 
-def main():
-    dry = "--dry" in sys.argv
-    limit = None
-    if "--limit" in sys.argv:
-        limit = int(sys.argv[sys.argv.index("--limit") + 1])
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0],
+        epilog="With no flags this runs the LIVE monthly job (Vision calls, "
+               "then apply). Use --dry to plan only.")
+    p.add_argument("--dry", action="store_true",
+                   help="scan and plan only; no API calls, nothing applied")
+    p.add_argument("--limit", type=int, default=None, metavar="N",
+                   help="process at most N images this run (testing)")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    dry = args.dry
+    limit = args.limit
 
     geotag.load_env()
     immich_url = os.environ.get("IMMICH_URL", "")

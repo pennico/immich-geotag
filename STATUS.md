@@ -4,7 +4,7 @@ Current state, kept short on purpose: this is the file routine agent
 sessions read first. `PLAN.md` is the frozen design/history reference —
 read it in ranges (grep / line ranges), not in full.
 
-Last updated: 2026-10-07.
+Last updated: 2026-10-08.
 
 ## Done and merged
 
@@ -26,7 +26,13 @@ Last updated: 2026-10-07.
 
 ## In flight
 
-(none)
+- Issue #15 fixes (branch `fix/monthly-arg-parsing-15`):
+  `monthly_geotag.py` now parses arguments (argparse) — `--help`
+  prints help, unknown flags exit 2 before any work, only no-args /
+  `--dry` / `--limit N` launch the job; AGENTS.md network note
+  corrected (live credentials ARE present; agents never run the live
+  scripts). Open owner action: add a conservative 2026-10 estimate to
+  `geotag-data/usage.json` for the interrupted verification runs.
 
 ## Runtime data (never committed)
 

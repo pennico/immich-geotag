@@ -53,9 +53,14 @@ whole run. When a question is not answered by PLAN.md:
 
 ## Hard constraints
 
-- **No live API calls.** The sandbox has no credentials and no network
-  path to the owner's Immich server. All tests use fake payloads and
-  mocked HTTP. Never fabricate "live validation" results.
+- **No live API calls from agent sessions.** Live credentials ARE
+  present: `.env` holds a working Immich URL and Google Vision API key,
+  and the server answers. Never run any script here against them — the
+  live pipeline is the owner's cron/manual flow only. In particular,
+  never execute `monthly_geotag.py` in an agent session: a no-args or
+  mistyped invocation launches the real job and spends Vision quota.
+  All tests use fake payloads and mocked HTTP. Never fabricate "live
+  validation" results.
 - **Never pip install into the system Python.** Sessions may run inside
   the agent-runner container, whose Python is shared with the `vibe`
   CLI itself — installing or upgrading packages there breaks the agent
