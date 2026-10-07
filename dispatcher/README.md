@@ -42,6 +42,26 @@ the dispatcher files a blocker issue and pauses the repo; the owner's
 answer on that issue resumes with a fresh budget. QA has the same budget:
 2 QA passes on the same PR without approval -> blocker issue + pause.
 
+## Context diet (per-session data pull)
+
+Cached tokens dominate usage, and the measured top filler is the same
+text re-fetched by every session (one PR diff was pulled 5+ times across
+a single rework cycle on 2026-10-06). The engine now:
+
+- **Writes per-PR briefing files** (`dispatcher/briefings/pr-<n>.md`,
+  gitignored) before each review/rework/CI-fix session — diff +
+  comments + metadata fetched once per tick — and appends a prompt note
+  pointing the session at them instead of `gh pr diff` /
+  `gh pr view --comments`. Best-effort: a failed fetch falls back to
+  the session fetching itself. Briefings for closed PRs are removed
+  each tick.
+- **Rotates session logs**: transcripts gzip after 7 days, are deleted
+  after 30 (`rotate_logs()` at dispatcher start).
+
+The matching session norms (targeted reads, one full doc read per
+session, short status docs) are in `AGENTIC_WORK_STANDARDS.md` under
+"Context discipline".
+
 ## Notifications
 
 `dispatcher/notify.py` sends push notifications via ntfy (outbound HTTPS

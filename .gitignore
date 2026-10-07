@@ -9,3 +9,4 @@ __pycache__/
 dispatcher/state.json
 geotag-data/
 dispatcher/feedback_state.json
+dispatcher/briefings/

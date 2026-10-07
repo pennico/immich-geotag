@@ -82,6 +82,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -96,6 +97,11 @@ try:
     import feedback
 except ImportError:  # older engine copies without feedback.py
     feedback = None
+
+try:
+    import briefing
+except ImportError:  # older engine copies without briefing.py
+    briefing = None
 
 REPO = Path(__file__).resolve().parent.parent
 ROADMAP = REPO / "ROADMAP.md"
@@ -115,9 +121,12 @@ VERIFY_PER_MERGE = os.environ.get("DISPATCH_VERIFY_PER_MERGE", "").lower() \
     in ("1", "true", "yes")
 MAX_PRICE = os.environ.get("DISPATCH_MAX_PRICE", "10")
 SESSION_TIMEOUT_S = 5400
+RUN_TIMEOUT_S = 3600    # direct script jobs (`run` issues), no LLM session
 FAIL_STRIKES = 2   # failed sessions per roadmap item before pausing
 QA_STRIKES = 2     # QA passes per PR without approval before pausing
 LOOP_SETTLE_S = 30  # pause between sessions in --loop mode
+LOG_ROTATE_DAYS = 7   # gzip session logs older than this
+LOG_DELETE_DAYS = 30  # delete rotated logs older than this
 REPO_NAME = "immich-geotag"
 ADV_LABEL = "approved-adversarial"
 
@@ -127,6 +136,26 @@ BLOCKER_HOWTO = ("\n\n---\n\n**How to answer:** comment below, then add the "
                  "`answered` label (gear icon → Labels → answered) — or "
                  "just reply to the Telegram notification. The loop "
                  "resumes within ~5 min of your answer.")
+
+# Appended by run_session() to EVERY session prompt, every role, every
+# repo: the one binding point that guarantees spending discipline
+# reaches the model even if it never opens the standards doc. Kept
+# short on purpose — it is re-sent on every turn of every session.
+SPENDING_DISCIPLINE = """
+
+Spending discipline (binding, every session): every turn re-sends this
+whole conversation, so anything pulled into it is re-paid on every step.
+- Pull small: grep/sed line ranges and head -N budgets; --stat before
+  any full diff; never cat a large file whole.
+- Web research: fetch truncated (head -c 20000), save the full page to
+  a file, quote only the relevant part; one page, then think — do not
+  fetch three.
+- Externalize: write findings, plans, and status to files (docs,
+  notes, STATUS.md) instead of carrying them in the conversation, and
+  keep the project's STATUS.md current as you go.
+- Re-read nothing this session already read; work from what is in the
+  conversation.
+- Prefer finishing in few turns over exploring broadly."""
 
 IMPL_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
 Read AGENTS.md first, then PLAN.md — it is the complete approved spec.
@@ -357,6 +386,7 @@ def maybe_save(state, dry):
 def ensure_labels():
     for name, color in (("approved", "0E8A16"), ("blocker", "D93F0B"),
                         ("answered", "FBCA04"), ("task", "1D76DB"),
+                        ("run", "D4C5F9"),
                         ("approved-adversarial", "5319E7")):
         run(["gh", "label", "create", name, "--color", color])
 
@@ -370,6 +400,33 @@ def pr_labels(number):
     if data is None:
         return None
     return {l["name"] for l in data.get("labels", [])}
+
+
+def pr_files(number):
+    data = gh_json(["gh", "pr", "view", str(number), "--json", "files"])
+    if data is None:
+        return None
+    return [f.get("path", "") for f in data.get("files", [])]
+
+
+def is_engine_sync(number):
+    """True for PRs that only sync the dispatcher engine (dispatcher/ files).
+
+    The same code was already reviewed in pennico-ops; running the full
+    two-reviewer pipeline with rework rounds per project repo is what
+    churned grocery-analysis for nothing on 2026-10-06. Sync PRs get a
+    fast lane instead: one QA pass, no adversarial session, one rework
+    round before escalating to the owner.
+    """
+    files = pr_files(number)
+    if not files:
+        return False
+    return all(f.startswith("dispatcher/") for f in files)
+
+
+def pr_head(number):
+    data = gh_json(["gh", "pr", "view", str(number), "--json", "headRefOid"])
+    return (data or {}).get("headRefOid")
 
 
 def checks_state(number):
@@ -407,6 +464,71 @@ def task_issues():
     return gh_json(["gh", "issue", "list", "--label", "task",
                     "--state", "open", "--json", "number,title"]) or []
 
+
+def run_issues():
+    """Open issues labeled `run`: direct script jobs, no LLM session."""
+    return gh_json(["gh", "issue", "list", "--label", "run",
+                    "--state", "open", "--json", "number,title,body"]) or []
+
+
+def execute_run_issue(issue, dry):
+    """Run the command in a `run`-labeled issue directly — no vibe session.
+
+    GitHub is the only trigger bus: calendar jobs (e.g. the monthly
+    geotag backfill) used to be host cron entries; they are now
+    scheduled GitHub Actions that file `run` issues, and this executor
+    reacts within one tick. The issue body's first non-empty line is the
+    command, run in the repo root. The output tail is commented back on
+    the issue; success closes it, failure escalates to `blocker`.
+    Returns the tick status.
+    """
+    n = issue["number"]
+    body = (issue.get("body") or "").strip()
+    cmd = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+    if not cmd or cmd.startswith("#"):
+        log(f"run issue #{n}: no command in body; closing as invalid")
+        if not dry:
+            run(["gh", "issue", "comment", str(n), "--body",
+                 "No command found: the first non-empty line of the body "
+                 "must be the command to run. Closing."])
+            run(["gh", "issue", "close", str(n)])
+        return "worked"
+    log(f"run issue #{n}: {cmd}")
+    if dry:
+        log("would execute run issue")
+        return "worked"
+    notify.notify(f"{REPO_NAME}: run job started",
+                  f"#{n} {issue['title']}\n\n`{cmd}` — no agent session, "
+                  "direct execution. No action needed.", tags="rocket")
+    try:
+        argv = shlex.split(cmd)
+        r = subprocess.run(argv, cwd=REPO, capture_output=True, text=True,
+                           timeout=RUN_TIMEOUT_S)
+        code, out = r.returncode, (r.stdout or "") + (r.stderr or "")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        code, out = 1, str(e)
+    tail = "\n".join(out.splitlines()[-40:]) or "(no output)"
+    if code == 0:
+        run(["gh", "issue", "comment", str(n), "--body",
+             f"`{cmd}` finished (exit 0). Output tail:\n\n```\n{tail}\n```"])
+        run(["gh", "issue", "close", str(n)])
+        notify.notify(f"{REPO_NAME}: run job done",
+                      f"#{n} {issue['title']}", tags="ok")
+    else:
+        run(["gh", "issue", "comment", str(n), "--body",
+             f"`{cmd}` failed (exit {code}). Output tail:\n\n```\n{tail}\n```\n\n"
+             "The dispatcher paused this repo; comment here and add the "
+             "`answered` label to resume."])
+        run(["gh", "issue", "edit", str(n), "--add-label", "blocker"])
+        state = load_state()
+        state.setdefault("seen_blockers", []).append(n)
+        save_state(state)
+        notify.notify(f"{REPO_NAME}: run job failed — needs your attention",
+                      f"#{n} {issue['title']}\n\n"
+                      "Comment on the issue and add the `answered` label "
+                      "(or reply here) to resume.",
+                      priority="high", tags="warning")
+    return "worked"
 
 
 def issue_comments(number):
@@ -724,6 +846,33 @@ def pause_for_quota_or_budget(state, res, dry):
     return "blocked"
 
 
+def rotate_logs():
+    """Gzip session logs older than LOG_ROTATE_DAYS; delete older than
+    LOG_DELETE_DAYS. Best-effort: never raises into the tick.
+
+    Session transcripts are large (up to ~2 MB each) and accumulate
+    fast on busy days; the logs dir reached ~55 MB across four repos
+    within a week of operation.
+    """
+    now = time.time()
+    rotate_after = LOG_ROTATE_DAYS * 86400
+    delete_after = LOG_DELETE_DAYS * 86400
+    try:
+        for f in LOGDIR.iterdir():
+            age = now - f.stat().st_mtime
+            if f.suffix == ".gz":
+                if age > delete_after:
+                    f.unlink()
+                continue
+            if age > rotate_after:
+                import gzip
+                with gzip.open(f.with_suffix(f.suffix + ".gz"), "wb") as out:
+                    out.write(f.read_bytes())
+                f.unlink()
+    except OSError as e:
+        log(f"log rotation skipped: {e}")
+
+
 def run_session(role, prompt):
     """Launch one vibe session; returns a SessionResult, None if vibe is
     missing. Raises Shutdown if SIGTERM arrived (before or during the
@@ -748,7 +897,11 @@ def run_session(role, prompt):
     logfile = LOGDIR / f"{ts}-{role}.json"
     log(f"starting {role} session (log: {logfile.name})")
     max_turns = MAX_TURNS if role in ("impl", "arch") else MAX_TURNS_REVIEW
-    cmd = ["vibe", "-p", prompt, "--auto-approve", "--trust",
+    # The discipline preamble rides along on every launch: the binding
+    # point that reaches the model without depending on it reading
+    # AGENTS.md or the standards doc first.
+    cmd = ["vibe", "-p", prompt + SPENDING_DISCIPLINE,
+           "--auto-approve", "--trust",
            "--max-turns", max_turns, "--max-price", MAX_PRICE,
            "--output", "json"]
     try:
@@ -1044,6 +1197,13 @@ def tick(dry):
                     maybe_save(state, dry)
                     return "worked"
 
+    # --- run issues: direct script jobs, no LLM session ---
+    # GitHub is the only trigger bus: scheduled Actions file `run`
+    # issues instead of host cron entries starting agent work.
+    for issue in run_issues():
+        maybe_save(state, dry)
+        return execute_run_issue(issue, dry)
+
     # --- task issues: owner-filed work orders (launch from the phone) ---
     tasks = gh_json(["gh", "issue", "list", "--label", "task",
                      "--state", "open", "--json", "number,title,url"])
@@ -1117,6 +1277,8 @@ def tick(dry):
     prs = open_prs()
     if prs is None:
         return "abort"
+    if briefing:
+        briefing.cleanup_briefings([p["number"] for p in prs])
     for p in prs:
         if p["number"] not in state["seen_prs"]:
             state["seen_prs"].append(p["number"])
@@ -1169,8 +1331,10 @@ def tick(dry):
                     if dry:
                         log(f"would run CI fix session for PR #{p['number']}")
                     else:
+                        ci_note = (briefing.prepare_briefings([p["number"]])
+                                   if briefing else "")
                         res = run_session("impl", CI_FIX_PROMPT.format(
-                            number=p["number"], title=p["title"]))
+                            number=p["number"], title=p["title"]) + ci_note)
                         if res is not None and (res.quota or res.budget):
                             # the fix session never ran; do not burn the
                             # one-shot budget or invalidate approvals
@@ -1261,13 +1425,28 @@ def tick(dry):
                 targets = corr
             else:
                 role, prompt, label = "adv", ADV_PROMPT, ADV_LABEL
-                targets = in_review
+                # Fast lane: engine syncs carry code already adversarially
+                # reviewed in pennico-ops — no second review session per
+                # project repo, just the label so the PR can merge.
+                auto = [p for p in in_review if is_engine_sync(p["number"])]
+                for p in auto:
+                    log(f"PR #{p['number']}: engine sync — fast lane, "
+                        "no adversarial session")
+                    if not dry:
+                        run(["gh", "pr", "edit", str(p["number"]),
+                             "--add-label", ADV_LABEL])
+                targets = [p for p in in_review if p not in auto]
+                if not targets:
+                    maybe_save(state, dry)
+                    return "worked"
             log(f"PRs needing {role} review: {[p['number'] for p in targets]}")
             if dry:
                 maybe_save(state, dry)
                 return "worked"
             maybe_save(state, dry)
-            res = run_session(role, prompt)
+            review_note = briefing.prepare_briefings(
+                [p["number"] for p in targets]) if briefing else ""
+            res = run_session(role, prompt + review_note)
             if res is None:
                 return "abort"
             if res.quota or res.budget:
@@ -1282,14 +1461,18 @@ def tick(dry):
                     return "abort"
                 if label in after:
                     state["qa_strikes"].pop(str(n), None)
+                    if label == "approved" and is_engine_sync(n):
+                        log(f"PR #{n}: engine sync passed QA — fast lane to merge")
+                        run(["gh", "pr", "edit", str(n), "--add-label", ADV_LABEL])
                     continue
                 strikes = state["qa_strikes"].get(str(n), 0) + 1
                 state["qa_strikes"][str(n)] = strikes
-                if strikes > QA_STRIKES:
+                cap = 1 if is_engine_sync(n) else QA_STRIKES
+                if strikes > cap:
                     log(f"PR #{n} failed review after rework rounds; pausing")
                     b = file_blocker(
                         f"PR #{n} failed review after rework rounds: {p['title']}",
-                        f"This PR failed {QA_STRIKES} review rounds (label "
+                        f"This PR failed {cap} review round(s) (label "
                         f"`{label}` not added; see the PR review comments), "
                         "each followed by a rework session. The dispatcher "
                         "paused this repo. Please take a look, then comment "
@@ -1306,13 +1489,43 @@ def tick(dry):
                     pause = True
                     continue
                 log(f"PR #{n} failed {role} review (strike {strikes}); launching rework")
+                head_before = pr_head(n)
+                rework_note = (briefing.prepare_briefings([n])
+                               if briefing else "")
                 res = run_session("impl", REWORK_PROMPT.format(
-                    number=n, title=p["title"]))
+                    number=n, title=p["title"]) + rework_note)
                 if res is not None and (res.quota or res.budget):
                     # rework could not run: undo this round's strike (the
                     # round restarts after the pause) and stop the tick
                     state["qa_strikes"][str(n)] = strikes - 1
                     return pause_for_quota_or_budget(state, res, dry)
+                if (res is not None and res.code == 0
+                        and pr_head(n) == head_before):
+                    # The rework session finished but pushed nothing:
+                    # another round would repeat the same review on the
+                    # same code — the loop is going in circles (this is
+                    # the "running for nothing" pattern from 2026-10-06).
+                    log(f"PR #{n}: rework made no progress; escalating")
+                    b = file_blocker(
+                        f"PR #{n} rework made no progress: {p['title']}",
+                        f"The rework session after a failed review finished "
+                        f"without pushing any new commits to PR #{n}. "
+                        "Repeating the review would loop on the same code, "
+                        "so the dispatcher paused this repo. Please take a "
+                        "look at the PR and the review comments, then "
+                        "comment here and add the `answered` label to "
+                        "resume.")
+                    if b:
+                        state["seen_blockers"].append(b)
+                        notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                      f"#{b} {p['title']}\n\n"
+                                      f"PR #{n}: rework pushed no changes. "
+                                      "Comment on the issue and add the "
+                                      "`answered` label (or reply here) "
+                                      "to resume.",
+                                      priority="high", tags="warning", url=p.get("url"))
+                    pause = True
+                    continue
                 if "approved" in after:
                     run(["gh", "pr", "edit", str(n), "--remove-label", "approved"])
                     log(f"PR #{n}: removed `approved` (code changed in rework)")
@@ -1433,6 +1646,7 @@ def main():
     loop = "--loop" in sys.argv
     signal.signal(signal.SIGTERM, _request_shutdown)
     LOGDIR.mkdir(exist_ok=True)
+    rotate_logs()
     lock = acquire_lock()
     if lock is None:
         log("another dispatcher tick is already running; skipping")
