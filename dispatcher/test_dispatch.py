@@ -345,6 +345,61 @@ def test_budget_date_rollover_resets(env, monkeypatch):
     write_budget(env, sessions=2, date="2020-01-01")
     assert dispatch.budget_spent() is False
 
+# --- issue #21: counter robustness ---
+
+def test_budget_corrupt_file_logs_loudly(env, monkeypatch):
+    logs = []
+    monkeypatch.setattr(dispatch, "log", lambda m: logs.append(m))
+    dispatch.BUDGET_FILE.write_text("{not json")
+    dispatch.budget_spent()
+    assert any("corrupt" in m for m in logs)
+
+
+def test_budget_missing_file_logs_loudly(env, monkeypatch):
+    # 2026-10-06: the live counter was deleted twice; the silent
+    # restart at zero unmetered every repo for the rest of the evening.
+    logs = []
+    monkeypatch.setattr(dispatch, "log", lambda m: logs.append(m))
+    dispatch.budget_spent()
+    assert any("MISSING" in m for m in logs)
+
+
+def test_budget_write_is_atomic(env, monkeypatch):
+    # No temp-file leftovers; the counter is always complete JSON, so
+    # a concurrent unlocked reader (budget_spent every tick) can never
+    # see a half-written file and silently restart the day at zero.
+    monkeypatch.setattr(dispatch, "DAILY_SESSIONS", 5)
+    monkeypatch.setattr(dispatch.subprocess, "Popen",
+                        lambda cmd, **k: FakeProc(code=0))
+    env.run_session("impl", "p")
+    env.run_session("impl", "p")
+    today = time.strftime("%Y-%m-%d")
+    entry = json.loads(dispatch.BUDGET_FILE.read_text())
+    assert entry[today]["sessions"] == 2
+    leftovers = [p.name for p in dispatch.BUDGET_FILE.parent.iterdir()
+                 if p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_run_session_creates_nothing_outside_tmp(env, monkeypatch):
+    # 2026-10-06: engine checks run by review sessions launched
+    # run_session against the REAL LOGDIR and left fake session logs
+    # in dispatcher/logs. run_session must write only where the module
+    # globals point; tests and repro scripts must point LOGDIR,
+    # BUDGET_FILE and STATE_FILE at a tmp dir first.
+    real_logs = dispatch.REPO / "dispatcher" / "logs"
+    before = sorted(p.name for p in real_logs.iterdir())
+    monkeypatch.setattr(dispatch.subprocess, "Popen",
+                        lambda cmd, **k: FakeProc(code=0))
+    env.run_session("impl", "p")
+    assert sorted(p.name for p in real_logs.iterdir()) == before
+    files = sorted(p.name for p in env.tmp.rglob("*") if p.is_file())
+    session_logs = [n for n in files if "-impl." in n]
+    assert len(session_logs) == 2  # the session's .json and .exit
+    assert [n for n in files if "-impl." not in n] == [
+        ".session-budget.json", ".session-budget.json.lock"]
+
+
 
 def test_tick_skips_sessions_when_budget_spent(env, monkeypatch):
     monkeypatch.setattr(dispatch, "DAILY_SESSIONS", 2)
