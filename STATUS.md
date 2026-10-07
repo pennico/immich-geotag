@@ -23,16 +23,17 @@ Last updated: 2026-10-08.
   community files (CONTRIBUTING, SECURITY).
 - PR #8: dispatcher engine sync (quota pause + session cost controls
   from pennico-ops #15/#16).
+- PR #16 (issue #15): `monthly_geotag.py` argparse — `--help` prints
+  help, unknown flags exit 2 before any work, only no-args / `--dry` /
+  `--limit N` launch the job; AGENTS.md network note corrected (live
+  credentials ARE present; agents never run the live scripts).
+  9 tests in `test_monthly_geotag.py`.
 
 ## In flight
 
-- Issue #15 fixes (branch `fix/monthly-arg-parsing-15`):
-  `monthly_geotag.py` now parses arguments (argparse) — `--help`
-  prints help, unknown flags exit 2 before any work, only no-args /
-  `--dry` / `--limit N` launch the job; AGENTS.md network note
-  corrected (live credentials ARE present; agents never run the live
-  scripts). Open owner action: add a conservative 2026-10 estimate to
-  `geotag-data/usage.json` for the interrupted verification runs.
+- Open owner action: add a conservative 2026-10 estimate to
+  `geotag-data/usage.json` for the interrupted verification runs
+  (owner-only, gitignored file).
 
 ## Runtime data (never committed)
 
