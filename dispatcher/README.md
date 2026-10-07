@@ -42,6 +42,73 @@ the dispatcher files a blocker issue and pauses the repo; the owner's
 answer on that issue resumes with a fresh budget. QA has the same budget:
 2 QA passes on the same PR without approval -> blocker issue + pause.
 
+## Session cost controls
+
+The engine (this repo is the canonical copy; the project repos carry
+the same code) caps session spend three ways:
+
+- **Shared daily session budget.** Every session launch, in every
+  repo, checks and increments `<projects>/.session-budget.json` (next
+  to `.publish-flags`, runtime data, never committed), keyed by date,
+  under an exclusive file lock — concurrent repos cannot overshoot
+  the cap or lose counts. The counter is written atomically (temp
+  file + rename), so a concurrent reader never sees a half-written
+  file. When the count reaches `DISPATCH_DAILY_SESSIONS` (default
+  14), no sessions launch for the rest of the day, the owner gets one
+  notification, and ticks stay cheap (git/gh only). A missing or
+  corrupt counter file never blocks a tick — it is recreated at zero,
+  **loudly**: the tick log says so, because a counter that vanishes
+  mid-day unmeters every repo (on 2026-10-06 agent sessions deleted
+  the live file twice and the budget silently restarted; issue #21).
+  The counter is live shared state — never delete or hand-edit it. A
+  reserved slot whose launch never started (vibe missing) is given
+  back, so a broken launch cannot burn the shared budget.
+- **Review strike cap.** A failed review round (the reviewer did not
+  add its label) counts one strike per PR in `qa_strikes`; the strike
+  is followed by a rework session. Strikes accumulate across BOTH
+  reviewers — a passed review does not reset them; only a merge does.
+  At `QA_STRIKES` (default 2) strikes the next failed round files a
+  blocker and pauses the repo (engine-sync PRs get a cap of 1). A
+  rework that could not run (API-quota pause or spent budget) undoes
+  its round's strike; a completed rework keeps it, and a rework that
+  pushes nothing escalates immediately instead of looping.
+- **API-quota pause.** A session that dies on an API-limit signature
+  (HTTP 402/429, quota, rate limit, ... — matched on the session's
+  stderr error line, never the stdout transcript, whose tool output
+  would false-match) is not a real failure: no strike, no rework, no
+  blocker, no diagnosis issue. The repo pauses for
+  `DISPATCH_QUOTA_COOLDOWN_S` (default 6h, `quota_pause_until` in
+  state.json) with one notification, then retries automatically.
+- **Role-based turn caps.** Implementation sessions run with
+  `--max-turns 150`; qa/adversarial/verify sessions with
+  `DISPATCH_MAX_TURNS_REVIEW` (default 60) — reviews rarely need the
+  cached-token tail of a full impl conversation.
+
+Delivery verification runs once per idle period; the per-merge
+verification is off by default (`DISPATCH_VERIFY_PER_MERGE=1` restores
+it).
+
+## Engine roles
+
+`impl`, `qa`, `adv`, and `verify` are the roles the loop launches.
+`arch` (architecture) exists only in tts-ereader, where ROADMAP items
+can be tagged `[arch]`; its roadmap work is done, but the role stays
+defined there. The turn-cap line (`impl`/`arch` get the full 150
+turns) mentions `arch` in every engine copy so the engine text stays
+identical across repos; in repos without the role it can never
+launch.
+
+## Tests
+
+`pytest dispatcher -q` (no network, no gh/git/vibe). The fixtures
+point `STATE_FILE`, `BUDGET_FILE`, `LOGDIR`, `PUBLISH_FLAGS`, and
+`ROADMAP` at `tmp_path`: tests and any ad-hoc script that exercises
+the engine must never read or write the real runtime state — on
+2026-10-06 engine checks run by review sessions launched `run_session`
+against the real `LOGDIR` and left fake session logs in
+`dispatcher/logs/` (issue #21). `test_run_session_creates_nothing_outside_tmp`
+guards this.
+
 ## Context diet (per-session data pull)
 
 Cached tokens dominate usage, and the measured top filler is the same
@@ -71,27 +138,6 @@ notifications are a silent no-op. Events: blocker filed (high), failure
 budget hit (high), roadmap done (high), PR opened/approved/merged
 (default). Failures to send are logged, never fatal — GitHub issues are
 the durable record.
-
-## Cost controls
-
-- Sessions run with `--max-price $DISPATCH_MAX_PRICE` (default 10) plus a
-  90-minute timeout. The cap is a runaway guard, not a budget target;
-  after the first supervised runs, calibrate it to roughly 2x the
-  observed cost of a normal session (token usage is in the session
-  JSON logs).
-- Implementation sessions run `--max-turns 150`; qa/adversarial/verify
-  sessions run `--max-turns $DISPATCH_MAX_TURNS_REVIEW` (default 60).
-- Every session launch checks and increments a shared daily counter
-  (`<projects>/.session-budget.json`, all repos, one budget). At
-  `DISPATCH_DAILY_SESSIONS` (default 14) no sessions launch for the rest
-  of the day; the owner is notified once.
-- A session that dies on an API-limit signature (HTTP 402/429, quota,
-  rate limit, ...) is not a real failure: no strike, no rework, no
-  blocker — the repo pauses for `DISPATCH_QUOTA_COOLDOWN_S` (default
-  6h) and retries automatically. GitHub's own rate limits (gh CLI,
-  api.github.com) are the exception (issue #9): they clear in minutes,
-  so they count a normal strike — after 2 strikes the diagnosis issue
-  reaches the owner — and never trigger the 6-hour pause.
 
 ## Guardrails
 

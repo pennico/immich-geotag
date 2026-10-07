@@ -4,6 +4,7 @@ rework no-progress guard, and `run`-labeled direct script jobs.
 Everything gh/git/vibe-shaped is mocked: no network, no repo side
 effects. On-disk state is pointed at tmp_path.
 """
+import json
 from types import SimpleNamespace
 
 import dispatch
@@ -25,6 +26,14 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(dispatch, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(dispatch, "LOGDIR", tmp_path / "logs")
     monkeypatch.setattr(dispatch, "ROADMAP", tmp_path / "ROADMAP.md")
+    # The tick gate reads the shared budget counter and merge paths
+    # touch .publish-flags: both are live runtime state outside the
+    # repo and must be pointed at tmp (issue #21 — tests never touch
+    # the real files).
+    monkeypatch.setattr(dispatch, "BUDGET_FILE",
+                        tmp_path / ".session-budget.json")
+    monkeypatch.setattr(dispatch, "PUBLISH_FLAGS",
+                        tmp_path / ".publish-flags")
     monkeypatch.setattr(dispatch.notify, "notify",
                         lambda *a, **k: e.sent.append(a) or True)
     e.sent = []
@@ -204,6 +213,59 @@ def test_rework_with_new_commits_continues(env):
     status = dispatch.tick(dry=False)
     assert status == "worked"
     assert not env.blockers
+
+
+# --- strike cap regression (2026-10-06, pennico-ops #21) ---
+#
+# The qa-approves / adversarial-fails / rework cycle reset the strike
+# counter on every qa approval, so the cap never accumulated and the
+# loop ground through five review rounds on one PR. Strikes must
+# persist across BOTH reviewers; only a merge clears them.
+
+
+def read_strikes():
+    state = json.loads(dispatch.STATE_FILE.read_text())
+    return state.get("qa_strikes", {})
+
+
+def test_completed_rework_keeps_strike(env):
+    add_pr(env, 15, ["src/app.py"])
+
+    def rework_pushed(role, prompt):
+        env.prs[15]["head"] = "sha2"
+        return dispatch.SessionResult(0)
+
+    env.results = {"impl": rework_pushed}
+    dispatch.tick(dry=False)  # qa fails -> strike 1 -> rework completes
+    assert read_strikes() == {"15": 1}  # the strike stays
+
+
+def test_qa_approval_does_not_reset_adversarial_strikes(env):
+    add_pr(env, 15, ["src/app.py"])
+
+    def qa_approves(role, prompt):
+        env.prs[15]["labels"].add("approved")
+        return dispatch.SessionResult(0)
+
+    def rework_pushed(role, prompt):
+        env.prs[15]["head"] = f"sha{next(env._rev)}"
+        env.prs[15]["labels"].discard("approved")  # rework invalidates QA
+        return dispatch.SessionResult(0)
+
+    env._rev = iter(range(2, 10))
+    env.results = {"qa": qa_approves, "impl": rework_pushed}
+    dispatch.tick(dry=False)  # qa approves
+    dispatch.tick(dry=False)  # adv fails -> strike 1 -> rework
+    assert read_strikes() == {"15": 1}
+    dispatch.tick(dry=False)  # qa approves again: must NOT reset the strike
+    assert read_strikes() == {"15": 1}
+    dispatch.tick(dry=False)  # adv fails again -> strike 2, still no pause
+    assert read_strikes() == {"15": 2}
+    assert not env.blockers
+    dispatch.tick(dry=False)  # qa approves
+    status = dispatch.tick(dry=False)  # adv fails -> strike 3 > cap
+    assert status == "blocked"
+    assert env.blockers
 
 
 # --- run issues: direct script jobs ---
