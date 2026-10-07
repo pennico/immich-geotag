@@ -725,7 +725,20 @@ def budget_read():
         entry = data.get(today)
         if not isinstance(entry, dict):
             entry = {}
+    except FileNotFoundError:
+        # Loud on purpose (issue #21): a counter that vanishes mid-day
+        # restarts the shared budget at zero and unmeters every repo.
+        # On 2026-10-06 agent sessions deleted the live file twice,
+        # silently. Missing is only normal before the first launch
+        # ever; the first budget_reserve() recreates the file, so this
+        # logs at most once per deletion episode.
+        log("session budget counter MISSING; restarting the day at "
+            f"zero sessions — if this was not just created, find what "
+            f"deletes {BUDGET_FILE}")
+        entry = {}
     except (OSError, ValueError):
+        log("session budget counter unreadable (corrupt); recreating "
+            "today at zero sessions")
         entry = {}
     sessions = entry.get("sessions")
     if not isinstance(sessions, int) or isinstance(sessions, bool):
@@ -743,6 +756,24 @@ def budget_spent():
         return False
     _, entry = budget_read()
     return int(entry.get("sessions", 0)) >= DAILY_SESSIONS
+
+
+def _budget_write(today, entry):
+    """Atomically replace the counter file (callers hold its lock).
+
+    write_text truncates in place, so a concurrent unlocked reader
+    (budget_spent on every tick) can catch a half-written file, treat
+    it as corrupt, and silently restart the day at zero. Write to a
+    temp file and os.replace() it: readers see the old or the new
+    content, never a partial file.
+    """
+    tmp = BUDGET_FILE.with_name(BUDGET_FILE.name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump({today: entry}, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, BUDGET_FILE)
 
 
 def budget_reserve():
@@ -774,8 +805,7 @@ def budget_reserve():
                               and not entry.get("notified"))
                 if just_spent:
                     entry["notified"] = True
-                BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
-                                                  sort_keys=True) + "\n")
+                _budget_write(today, entry)
             finally:
                 fcntl.flock(lockfh, fcntl.LOCK_UN)
     except OSError as e:
@@ -812,8 +842,7 @@ def budget_release():
                 entry["sessions"] = max(0, entry.get("sessions", 0) - 1)
                 if entry["sessions"] < DAILY_SESSIONS:
                     entry.pop("notified", None)
-                BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
-                                                  sort_keys=True) + "\n")
+                _budget_write(today, entry)
             finally:
                 fcntl.flock(lockfh, fcntl.LOCK_UN)
     except OSError as e:
@@ -1460,7 +1489,12 @@ def tick(dry):
                 if after is None:
                     return "abort"
                 if label in after:
-                    state["qa_strikes"].pop(str(n), None)
+                    # A passed review does NOT clear this PR's strike
+                    # count: strikes accumulate across both reviewers
+                    # until the PR merges (only the merge pops them).
+                    # Resetting on a pass let the qa-approves /
+                    # adversarial-fails alternation loop forever past
+                    # the cap (2026-10-06, issue #21).
                     if label == "approved" and is_engine_sync(n):
                         log(f"PR #{n}: engine sync passed QA — fast lane to merge")
                         run(["gh", "pr", "edit", str(n), "--add-label", ADV_LABEL])
