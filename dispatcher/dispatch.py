@@ -36,13 +36,26 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
   7. Else: idle (roadmap complete) -> notify once.
 
 Delivery verification: when the loop considers the delivery complete —
-after a PR merges, and once when a repo goes idle — a verification
-session asks: "Has the project fulfilled its scope and are all the
-deliverables completed, and stored correctly?" Gaps are filed as
-`[verify]` task issues the loop picks up next tick; a clean pass notifies
-the owner. An approved PR whose CI stays red gets one automatic fix
-session (the fix re-enters the review pipeline) before the dispatcher
-escalates to a blocker.
+once per idle period (per-merge verification is available behind
+DISPATCH_VERIFY_PER_MERGE, default off) — a verification session asks:
+"Has the project fulfilled its scope and are all the deliverables
+completed, and stored correctly?" Gaps are filed as `[verify]` task
+issues the loop picks up next tick; a clean pass notifies the owner.
+An approved PR whose CI stays red gets one automatic fix session (the
+fix re-enters the review pipeline) before the dispatcher escalates to
+a blocker.
+
+Cost controls: every session launch checks and increments a shared
+daily counter (<projects>/.session-budget.json, one budget for all
+repos; DISPATCH_DAILY_SESSIONS, default 14). When it is spent, no
+sessions launch for the rest of the day and the owner is notified
+once; ticks stay cheap. A session that dies on an API-limit signature
+(HTTP 402/429, quota, rate limit, ...) is not a real failure: no
+strike, no rework, no blocker — the repo pauses for a cooldown
+(state.json `quota_pause_until`, DISPATCH_QUOTA_COOLDOWN_S, default
+6h) and retries automatically. Implementation sessions run with
+--max-turns 150; qa/adv/verify sessions with DISPATCH_MAX_TURNS_REVIEW
+(default 60).
 
 Failure budget: dispatcher/state.json counts consecutive failed sessions
 (non-zero exit or timeout) per roadmap item. 2 strikes on the same item ->
@@ -50,8 +63,9 @@ the dispatcher files a blocker issue and pauses the repo; the owner's
 answer on that issue resumes the loop with a fresh budget.
 
 Sessions run: vibe -p <prompt> --auto-approve --trust --max-turns 150
---max-price $DISPATCH_MAX_PRICE (default 10) --output json, 90-minute
-timeout, output captured to dispatcher/logs/.
+(impl/arch) or 60 (qa/adv/verify) --max-price $DISPATCH_MAX_PRICE
+(default 10) --output json, 90-minute timeout, output captured to
+dispatcher/logs/.
 
 Gentle shutdown: on SIGTERM (container stop, reboot) the running session
 is terminated, its uncommitted work is stashed, and the loop exits 0.
@@ -68,6 +82,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -83,18 +98,35 @@ try:
 except ImportError:  # older engine copies without feedback.py
     feedback = None
 
+try:
+    import briefing
+except ImportError:  # older engine copies without briefing.py
+    briefing = None
+
 REPO = Path(__file__).resolve().parent.parent
 ROADMAP = REPO / "ROADMAP.md"
 LOGDIR = REPO / "dispatcher" / "logs"
 STATE_FILE = REPO / "dispatcher" / "state.json"
 LOCK_FILE = REPO / "dispatcher" / ".lock"
 PUBLISH_FLAGS = REPO.parent / ".publish-flags"
+BUDGET_FILE = REPO.parent / ".session-budget.json"
 MAX_TURNS = "150"
+MAX_TURNS_REVIEW = os.environ.get("DISPATCH_MAX_TURNS_REVIEW", "60")
+DAILY_SESSIONS = int(os.environ.get("DISPATCH_DAILY_SESSIONS", "14"))
+QUOTA_COOLDOWN_S = int(os.environ.get("DISPATCH_QUOTA_COOLDOWN_S",
+                                      str(6 * 3600)))
+# Allowlist: any other value — including the natural way to say "off" —
+# must leave the default-off behavior alone.
+VERIFY_PER_MERGE = os.environ.get("DISPATCH_VERIFY_PER_MERGE", "").lower() \
+    in ("1", "true", "yes")
 MAX_PRICE = os.environ.get("DISPATCH_MAX_PRICE", "10")
 SESSION_TIMEOUT_S = 5400
+RUN_TIMEOUT_S = 3600    # direct script jobs (`run` issues), no LLM session
 FAIL_STRIKES = 2   # failed sessions per roadmap item before pausing
 QA_STRIKES = 2     # QA passes per PR without approval before pausing
 LOOP_SETTLE_S = 30  # pause between sessions in --loop mode
+LOG_ROTATE_DAYS = 7   # gzip session logs older than this
+LOG_DELETE_DAYS = 30  # delete rotated logs older than this
 REPO_NAME = "immich-geotag"
 ADV_LABEL = "approved-adversarial"
 
@@ -104,6 +136,26 @@ BLOCKER_HOWTO = ("\n\n---\n\n**How to answer:** comment below, then add the "
                  "`answered` label (gear icon → Labels → answered) — or "
                  "just reply to the Telegram notification. The loop "
                  "resumes within ~5 min of your answer.")
+
+# Appended by run_session() to EVERY session prompt, every role, every
+# repo: the one binding point that guarantees spending discipline
+# reaches the model even if it never opens the standards doc. Kept
+# short on purpose — it is re-sent on every turn of every session.
+SPENDING_DISCIPLINE = """
+
+Spending discipline (binding, every session): every turn re-sends this
+whole conversation, so anything pulled into it is re-paid on every step.
+- Pull small: grep/sed line ranges and head -N budgets; --stat before
+  any full diff; never cat a large file whole.
+- Web research: fetch truncated (head -c 20000), save the full page to
+  a file, quote only the relevant part; one page, then think — do not
+  fetch three.
+- Externalize: write findings, plans, and status to files (docs,
+  notes, STATUS.md) instead of carrying them in the conversation, and
+  keep the project's STATUS.md current as you go.
+- Re-read nothing this session already read; work from what is in the
+  conversation.
+- Prefer finishing in few turns over exploring broadly."""
 
 IMPL_PROMPT = """You are the Implementation agent for this repository (unattended headless run).
 Read AGENTS.md first, then PLAN.md — it is the complete approved spec.
@@ -334,6 +386,7 @@ def maybe_save(state, dry):
 def ensure_labels():
     for name, color in (("approved", "0E8A16"), ("blocker", "D93F0B"),
                         ("answered", "FBCA04"), ("task", "1D76DB"),
+                        ("run", "D4C5F9"),
                         ("approved-adversarial", "5319E7")):
         run(["gh", "label", "create", name, "--color", color])
 
@@ -347,6 +400,33 @@ def pr_labels(number):
     if data is None:
         return None
     return {l["name"] for l in data.get("labels", [])}
+
+
+def pr_files(number):
+    data = gh_json(["gh", "pr", "view", str(number), "--json", "files"])
+    if data is None:
+        return None
+    return [f.get("path", "") for f in data.get("files", [])]
+
+
+def is_engine_sync(number):
+    """True for PRs that only sync the dispatcher engine (dispatcher/ files).
+
+    The same code was already reviewed in pennico-ops; running the full
+    two-reviewer pipeline with rework rounds per project repo is what
+    churned grocery-analysis for nothing on 2026-10-06. Sync PRs get a
+    fast lane instead: one QA pass, no adversarial session, one rework
+    round before escalating to the owner.
+    """
+    files = pr_files(number)
+    if not files:
+        return False
+    return all(f.startswith("dispatcher/") for f in files)
+
+
+def pr_head(number):
+    data = gh_json(["gh", "pr", "view", str(number), "--json", "headRefOid"])
+    return (data or {}).get("headRefOid")
 
 
 def checks_state(number):
@@ -384,6 +464,71 @@ def task_issues():
     return gh_json(["gh", "issue", "list", "--label", "task",
                     "--state", "open", "--json", "number,title"]) or []
 
+
+def run_issues():
+    """Open issues labeled `run`: direct script jobs, no LLM session."""
+    return gh_json(["gh", "issue", "list", "--label", "run",
+                    "--state", "open", "--json", "number,title,body"]) or []
+
+
+def execute_run_issue(issue, dry):
+    """Run the command in a `run`-labeled issue directly — no vibe session.
+
+    GitHub is the only trigger bus: calendar jobs (e.g. the monthly
+    geotag backfill) used to be host cron entries; they are now
+    scheduled GitHub Actions that file `run` issues, and this executor
+    reacts within one tick. The issue body's first non-empty line is the
+    command, run in the repo root. The output tail is commented back on
+    the issue; success closes it, failure escalates to `blocker`.
+    Returns the tick status.
+    """
+    n = issue["number"]
+    body = (issue.get("body") or "").strip()
+    cmd = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+    if not cmd or cmd.startswith("#"):
+        log(f"run issue #{n}: no command in body; closing as invalid")
+        if not dry:
+            run(["gh", "issue", "comment", str(n), "--body",
+                 "No command found: the first non-empty line of the body "
+                 "must be the command to run. Closing."])
+            run(["gh", "issue", "close", str(n)])
+        return "worked"
+    log(f"run issue #{n}: {cmd}")
+    if dry:
+        log("would execute run issue")
+        return "worked"
+    notify.notify(f"{REPO_NAME}: run job started",
+                  f"#{n} {issue['title']}\n\n`{cmd}` — no agent session, "
+                  "direct execution. No action needed.", tags="rocket")
+    try:
+        argv = shlex.split(cmd)
+        r = subprocess.run(argv, cwd=REPO, capture_output=True, text=True,
+                           timeout=RUN_TIMEOUT_S)
+        code, out = r.returncode, (r.stdout or "") + (r.stderr or "")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        code, out = 1, str(e)
+    tail = "\n".join(out.splitlines()[-40:]) or "(no output)"
+    if code == 0:
+        run(["gh", "issue", "comment", str(n), "--body",
+             f"`{cmd}` finished (exit 0). Output tail:\n\n```\n{tail}\n```"])
+        run(["gh", "issue", "close", str(n)])
+        notify.notify(f"{REPO_NAME}: run job done",
+                      f"#{n} {issue['title']}", tags="ok")
+    else:
+        run(["gh", "issue", "comment", str(n), "--body",
+             f"`{cmd}` failed (exit {code}). Output tail:\n\n```\n{tail}\n```\n\n"
+             "The dispatcher paused this repo; comment here and add the "
+             "`answered` label to resume."])
+        run(["gh", "issue", "edit", str(n), "--add-label", "blocker"])
+        state = load_state()
+        state.setdefault("seen_blockers", []).append(n)
+        save_state(state)
+        notify.notify(f"{REPO_NAME}: run job failed — needs your attention",
+                      f"#{n} {issue['title']}\n\n"
+                      "Comment on the issue and add the `answered` label "
+                      "(or reply here) to resume.",
+                      priority="high", tags="warning")
+    return "worked"
 
 
 def issue_comments(number):
@@ -476,26 +621,298 @@ def recover_dirty_tree():
     return stashed or bool(branches)
 
 
-def run_session(role, prompt):
-    """Returns the session exit code, 124 on timeout, None if vibe is missing.
+class SessionResult:
+    """Outcome of one session launch attempt.
 
-    Raises Shutdown if SIGTERM arrived (before or during the session).
+    code: the vibe exit code (124 on timeout), None if vibe never started.
+    quota: the failure carries an API-limit signature (issue #15) — not a
+        real failure; the loop pauses instead of burning failure budgets.
+    budget: the shared daily session budget was spent; nothing launched.
+    """
+
+    def __init__(self, code, quota=False, budget=False):
+        self.code = code
+        self.quota = quota
+        self.budget = budget
+
+
+# API-limit signatures in a dying session's error output (case-insensitive).
+# A session that exits non-zero carrying one of these hit the Mistral
+# subscription limit, not a real failure (issue #15). The numeric codes are
+# anchored to an HTTP/status/error prefix or their status text, and words
+# that also occur in ordinary failures ("exceeded", "insufficient",
+# "credit") only match inside API-limit phrases — a line number, a token
+# count or "max turns exceeded" is never a quota death.
+QUOTA_SIG = re.compile(
+    r"\bhttps?(?:/1\.[01])?\s*[\"']?\s*(402|429)\b"
+    r"|\b(?:status|error|exit|response)(?:\s+code)?\s*[\"']?:?\s*(402|429)\b"
+    r"|\b(402|429)\s*[-:]\s*(?:too\s+many\s+requests|payment\s+required)\b"
+    r"|\b(402|429)\s+(?:too\s+many\s+requests|payment\s+required)\b"
+    r"|\bquota\b"
+    r"|\brate[ _-]?limits?\b"
+    r"|\binsufficient\s+(?:credit|balance|fund)"
+    r"|\bpayment\s+required\b"
+    r"|\bcredits?\s+(?:exhausted|depleted|ran\s+out)\b"
+    r"|\bout\s+of\s+credits?\b"
+    r"|\bbalance\s+(?:is\s+)?(?:too\s+low|exhausted)\b"
+    r"|\b(?:monthly|daily|weekly|usage|api|request|subscription)\s+limits?\b",
+    re.IGNORECASE)
+
+# GitHub's own rate limits (gh CLI, api.github.com) are much shorter-lived
+# than the provider quota and must not trigger the 6-hour pause (blocker
+# #9, owner option 1): a GitHub rate limit is a normal failure — it
+# counts a strike, and two strikes reach the owner through the diagnosis
+# issue. Every signature is anchored to a GitHub-specific marker (gh CLI
+# error prefix, api.github.com, "secondary rate limit", GitHub's abuse
+# detector) so a provider quota death — which never mentions gh/GitHub —
+# still pauses. When both signatures appear in the same tail the GitHub
+# one wins: the safe direction is a strike (which surfaces to the owner
+# after 2 strikes), not a wrong-provider 6-hour pause.
+GITHUB_RATE_SIG = re.compile(
+    r"\bsecondary\s+rate\s+limit\b"
+    r"|\bapi\.github\.com\b[^.\n]{0,120}\brate[ _-]?limits?\b"
+    r"|\brate[ _-]?limits?\b[^.\n]{0,120}\bapi\.github\.com\b"
+    r"|\bgh\b\s*:[^.\n]{0,120}\brate[ _-]?limits?\b"
+    r"|\bgithub\b[^.\n]{0,80}\brate[ _-]?limits?\b"
+    r"|\brate[ _-]?limits?\b[^.\n]{0,80}\bgithub\b"
+    r"|\babuse\s+detection\s+mechanism\b",
+    re.IGNORECASE)
+
+# Only this many final characters of the CLI's error output are scanned
+# for a quota signature: the signature must come from the session's dying
+# moments (a CLI error, a traceback), not from text that merely quoted
+# quota-related content — this file's own source, a plan, a review.
+OUTPUT_TAIL_S = 2000
+
+
+def is_quota_failure(code, output):
+    """True when a non-zero session exit carries an API-limit signature.
+
+    Scans the final OUTPUT_TAIL_S characters of the CLI's own error
+    output: run_session passes stderr only, never the session transcript
+    (stdout) — a session implementing or reviewing the quota feature says
+    "quota" constantly, and its transcript must not turn a real crash into
+    a quota death. A signature that lands outside stderr falls back to
+    normal failure handling (strike + diagnosis), the safe direction.
+
+    A GitHub rate limit is never a quota death (blocker #9): the agent
+    sessions run gh constantly and GitHub's limits clear in minutes, so
+    they count a normal strike instead of pausing the repo for hours.
+    """
+    if code in (0, 124, None):
+        return False
+    tail = output[-OUTPUT_TAIL_S:]
+    if GITHUB_RATE_SIG.search(tail):
+        return False
+    return bool(QUOTA_SIG.search(tail))
+
+
+def budget_read():
+    """(today, entry) from the shared counter; corrupt/missing -> fresh.
+
+    The counter file is shared by all repos' dispatchers (one subscription,
+    one budget) and lives outside the repos, next to .publish-flags. A
+    missing or unreadable file must never block a tick: start at zero.
+    A valid-JSON file whose `sessions` value has the wrong type (null,
+    object, ...) is the same corruption: reset it to 0 here so neither
+    budget_spent() nor budget_reserve() can crash on it.
+    """
+    today = time.strftime("%Y-%m-%d")
+    try:
+        data = json.loads(BUDGET_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        entry = data.get(today)
+        if not isinstance(entry, dict):
+            entry = {}
+    except (OSError, ValueError):
+        entry = {}
+    sessions = entry.get("sessions")
+    if not isinstance(sessions, int) or isinstance(sessions, bool):
+        entry["sessions"] = 0
+    return today, entry
+
+
+def budget_spent():
+    """True when today's shared session count reached the daily limit.
+
+    Cheap unlocked read for the tick gate; the authoritative check is
+    the locked budget_reserve() at launch time.
+    """
+    if DAILY_SESSIONS <= 0:
+        return False
+    _, entry = budget_read()
+    return int(entry.get("sessions", 0)) >= DAILY_SESSIONS
+
+
+def budget_reserve():
+    """Check the shared daily budget and count one launch, atomically.
+
+    Returns True when the session may launch (its slot counted), False
+    when today's budget is spent. The whole check-count-write runs
+    under an exclusive flock on a lock file next to the counter: the
+    counter is shared by all repos' dispatchers, and an unlocked
+    read-modify-write loses updates — concurrent repos could each pass
+    the check and overshoot the cap, and the one-time `notified` flag
+    can be lost. A missing or unwritable counter never blocks a tick:
+    fail open, like budget_read.
+    """
+    if DAILY_SESSIONS <= 0:
+        return True
+    just_spent = False
+    try:
+        BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BUDGET_FILE.parent / (BUDGET_FILE.name + ".lock"),
+                  "w") as lockfh:
+            fcntl.flock(lockfh, fcntl.LOCK_EX)
+            try:
+                today, entry = budget_read()
+                if int(entry.get("sessions", 0)) >= DAILY_SESSIONS:
+                    return False
+                entry["sessions"] = int(entry.get("sessions", 0)) + 1
+                just_spent = (entry["sessions"] >= DAILY_SESSIONS
+                              and not entry.get("notified"))
+                if just_spent:
+                    entry["notified"] = True
+                BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
+                                                  sort_keys=True) + "\n")
+            finally:
+                fcntl.flock(lockfh, fcntl.LOCK_UN)
+    except OSError as e:
+        log(f"could not update session budget: {e}")
+        return True
+    if just_spent:
+        notify.notify("agent loop: daily session budget spent",
+                      f"{entry['sessions']}/{DAILY_SESSIONS} headless "
+                      "sessions have run today across all repos (the "
+                      "budget is shared). No more sessions launch today; "
+                      "the loop resumes tomorrow. No action needed — tune "
+                      "DISPATCH_DAILY_SESSIONS if this is too tight.",
+                      tags="warning")
+    return True
+
+
+def budget_release():
+    """Give back a slot taken by budget_reserve() when the launch never
+    started (vibe missing): a launch that never runs must not burn the
+    shared daily budget — otherwise every tick spends one more slot and
+    the "budget spent" notification masks the real failure. Same lock
+    as budget_reserve(); a stale `notified` flag is cleared when the
+    count drops back below the cap so a real crossing still notifies.
+    """
+    if DAILY_SESSIONS <= 0:
+        return
+    try:
+        BUDGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BUDGET_FILE.parent / (BUDGET_FILE.name + ".lock"),
+                  "w") as lockfh:
+            fcntl.flock(lockfh, fcntl.LOCK_EX)
+            try:
+                today, entry = budget_read()
+                entry["sessions"] = max(0, entry.get("sessions", 0) - 1)
+                if entry["sessions"] < DAILY_SESSIONS:
+                    entry.pop("notified", None)
+                BUDGET_FILE.write_text(json.dumps({today: entry}, indent=2,
+                                                  sort_keys=True) + "\n")
+            finally:
+                fcntl.flock(lockfh, fcntl.LOCK_UN)
+    except OSError as e:
+        log(f"could not update session budget: {e}")
+
+
+def enter_quota_pause(state):
+    """Set the API-quota cooldown in state.json; notify the owner once."""
+    if state.get("quota_pause_until", 0) > time.time():
+        return  # already paused: one notification per episode
+    until = time.time() + QUOTA_COOLDOWN_S
+    state["quota_pause_until"] = until
+    resume = datetime.fromtimestamp(until).strftime("%H:%M")
+    log(f"API quota/limit exhausted; sessions paused until {resume}")
+    notify.notify(f"{REPO_NAME}: paused — API quota/limit exhausted",
+                  f"A session died on an API limit (HTTP 402/429 or "
+                  f"similar). No sessions launch until {resume}, then the "
+                  "loop retries automatically. No action needed.",
+                  tags="warning")
+
+
+def pause_for_quota_or_budget(state, res, dry):
+    """A session could not run (API-limit signature or spent daily
+    budget): pause the repo without counting a failure. Returns
+    'blocked' — the next ticks stay cheap until the cooldown expires or
+    the day rolls over."""
+    if res.quota:
+        enter_quota_pause(state)
+    maybe_save(state, dry)
+    return "blocked"
+
+
+def rotate_logs():
+    """Gzip session logs older than LOG_ROTATE_DAYS; delete older than
+    LOG_DELETE_DAYS. Best-effort: never raises into the tick.
+
+    Session transcripts are large (up to ~2 MB each) and accumulate
+    fast on busy days; the logs dir reached ~55 MB across four repos
+    within a week of operation.
+    """
+    now = time.time()
+    rotate_after = LOG_ROTATE_DAYS * 86400
+    delete_after = LOG_DELETE_DAYS * 86400
+    try:
+        for f in LOGDIR.iterdir():
+            age = now - f.stat().st_mtime
+            if f.suffix == ".gz":
+                if age > delete_after:
+                    f.unlink()
+                continue
+            if age > rotate_after:
+                import gzip
+                with gzip.open(f.with_suffix(f.suffix + ".gz"), "wb") as out:
+                    out.write(f.read_bytes())
+                f.unlink()
+    except OSError as e:
+        log(f"log rotation skipped: {e}")
+
+
+def run_session(role, prompt):
+    """Launch one vibe session; returns a SessionResult, None if vibe is
+    missing. Raises Shutdown if SIGTERM arrived (before or during the
+    session).
+
+    The shared daily budget is checked and counted here — the one
+    choke point every role and repo goes through, atomically under the
+    shared counter's lock. A reserved slot whose launch never started
+    (vibe missing) is given back: a launch that never runs must not
+    burn the shared daily budget. Reviews and verifications run with a
+    lower turn cap than implementation sessions (their conversations
+    rarely need the full tail).
     """
     global _session_proc
     if _shutdown["requested"]:
         raise Shutdown()
+    if not budget_reserve():
+        log(f"daily session budget spent; not launching {role} session")
+        return SessionResult(None, budget=True)
     LOGDIR.mkdir(exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
     logfile = LOGDIR / f"{ts}-{role}.json"
     log(f"starting {role} session (log: {logfile.name})")
-    cmd = ["vibe", "-p", prompt, "--auto-approve", "--trust",
-           "--max-turns", MAX_TURNS, "--max-price", MAX_PRICE,
+    max_turns = MAX_TURNS if role in ("impl", "arch") else MAX_TURNS_REVIEW
+    # The discipline preamble rides along on every launch: the binding
+    # point that reaches the model without depending on it reading
+    # AGENTS.md or the standards doc first.
+    cmd = ["vibe", "-p", prompt + SPENDING_DISCIPLINE,
+           "--auto-approve", "--trust",
+           "--max-turns", max_turns, "--max-price", MAX_PRICE,
            "--output", "json"]
     try:
         proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True)
-    except FileNotFoundError:
-        log("ABORT: vibe CLI not found on PATH")
+    except OSError as e:
+        # missing, not executable (broken update, noexec mount), ... —
+        # the launch never happened, so give the reserved unit back or
+        # every occurrence permanently shrinks the shared daily budget.
+        log(f"ABORT: could not launch vibe CLI: {e}")
+        budget_release()
         return None
     _session_proc = proc
     try:
@@ -506,17 +923,22 @@ def run_session(role, prompt):
         proc.communicate()
         (LOGDIR / f"{ts}-{role}.exit").write_text("timeout\n")
         log(f"{role} session timed out after {SESSION_TIMEOUT_S}s")
-        return 124
+        return SessionResult(124)
     finally:
         _session_proc = None
     logfile.write_text(stdout or "")
     if code != 0 and (stderr or "").strip():
         (LOGDIR / f"{ts}-{role}.err").write_text(stderr)
     (LOGDIR / f"{ts}-{role}.exit").write_text(str(code) + "\n")
-    log(f"{role} session finished, exit {code}")
+    # Quota classification reads the CLI's own error output (stderr) only:
+    # the transcript (stdout) routinely discusses quotas/rate limits and
+    # must not mask a real crash as an API-limit death.
+    quota = is_quota_failure(code, stderr or "")
+    log(f"{role} session finished, exit {code}"
+        + (" (API quota/limit signature)" if quota else ""))
     if _shutdown["requested"]:
         raise Shutdown()
-    return code
+    return SessionResult(code, quota=quota)
 
 
 def request_publish():
@@ -555,7 +977,7 @@ def report_session_failure(source, title):
                    f"{source} session failed: {title}", tail or "(no output)")
 
 
-def verify_delivery(delivered, dry):
+def verify_delivery(delivered, dry, state):
     """Run the delivery-verification session and report the verdict.
 
     Asks the verification question ("has the project fulfilled its scope
@@ -563,16 +985,27 @@ def verify_delivery(delivered, dry):
     session. The session files a `[verify]` task issue for gaps (the
     loop picks it up next tick); silence means pass. Never blocks the
     tick: a failed session is fed to the feedback loop, not the budget.
+
+    Returns True when a session actually ran (a verdict was attempted),
+    False when it could not run (API quota, spent budget, missing vibe)
+    — the caller keeps its verification flag so it retries later.
     """
     if dry:
         log(f"would run delivery verification: {delivered}")
-        return
+        return True
     before = {i["number"] for i in task_issues()}
-    code = run_session("verify", VERIFY_PROMPT.format(delivered=delivered))
-    if code is None or code != 0:
-        log(f"verification session failed (exit {code}); no verdict")
+    res = run_session("verify", VERIFY_PROMPT.format(delivered=delivered))
+    if res is None:
+        log("verification session could not start (vibe missing)")
+        return False
+    if res.quota or res.budget:
+        if res.quota:
+            enter_quota_pause(state)
+        return False
+    if res.code != 0:
+        log(f"verification session failed (exit {res.code}); no verdict")
         report_session_failure("verify", delivered)
-        return
+        return True
     gaps = [i for i in task_issues() if i["number"] not in before]
     if gaps:
         log(f"delivery verification found gaps: {[i['title'] for i in gaps]}")
@@ -587,6 +1020,7 @@ def verify_delivery(delivered, dry):
                       "Scope fulfilled; deliverables complete and stored "
                       "correctly. No action needed.",
                       tags="ok")
+    return True
 
 
 def tick(dry):
@@ -652,6 +1086,15 @@ def tick(dry):
             "waiting for the owner")
         maybe_save(state, dry)
         return "blocked"
+    # --- session-launch pauses: API-quota cooldown, daily budget ---
+    # While either is active no session launches at all; the tick stays
+    # cheap (git pull + gh queries + blocker notifications only).
+    if state.get("quota_pause_until", 0) > time.time() or budget_spent():
+        reason = ("API quota cooldown" if state.get("quota_pause_until", 0)
+                  > time.time() else "daily session budget spent")
+        log(f"sessions paused ({reason}); cheap tick, no launches")
+        maybe_save(state, dry)
+        return "blocked"
     if actionable:
         issue = actionable[0]
         if dry:
@@ -665,17 +1108,19 @@ def tick(dry):
         run(["gh", "issue", "edit", str(issue["number"]), "--remove-label", "answered"])
         state["resumed_blockers"].append(issue["number"])
         state["verified_idle"] = False  # new work: re-verify before idle again
+        state["failures"] = {}  # fresh failure budget after owner input
         state["ci_fix_tried"] = []     # fresh CI-fix budget too
         state["ci_escalated"] = []
         state["main_ci_strikes"] = 0   # fresh main-CI budget as well
-        state["failures"] = {}  # fresh failure budget after owner input
         maybe_save(state, dry)
         note = STASH_NOTE if state.get("stash_note_pending") else ""
-        code = run_session("impl", RESUME_PROMPT.format(
+        res = run_session("impl", RESUME_PROMPT.format(
             number=issue["number"], title=issue["title"], answer=answer) + note)
-        if code is None:
+        if res is None:
             return "abort"
-        if code == 0:
+        if res.quota or res.budget:
+            return pause_for_quota_or_budget(state, res, dry)
+        if res.code == 0:
             state.pop("stash_note_pending", None)
             request_publish()
             maybe_save(state, dry)
@@ -738,14 +1183,26 @@ def tick(dry):
                                   "The dispatcher is trying to fix it; "
                                   "you'll be notified again only if it "
                                   "cannot.", tags="warning")
-                    code = run_session("impl", MAIN_CI_FIX_PROMPT.format(
+                    res = run_session("impl", MAIN_CI_FIX_PROMPT.format(
                         run_id=rid, title=r.get("displayTitle", "")))
-                    if code is None:
+                    if res is None:
                         return "abort"
-                    if code == 0:
+                    if res.quota or res.budget:
+                        # the fix session never ran; do not burn a strike
+                        state["main_ci_fixed_runs"].remove(rid)
+                        state["main_ci_strikes"] -= 1
+                        return pause_for_quota_or_budget(state, res, dry)
+                    if res.code == 0:
                         request_publish()
                     maybe_save(state, dry)
                     return "worked"
+
+    # --- run issues: direct script jobs, no LLM session ---
+    # GitHub is the only trigger bus: scheduled Actions file `run`
+    # issues instead of host cron entries starting agent work.
+    for issue in run_issues():
+        maybe_save(state, dry)
+        return execute_run_issue(issue, dry)
 
     # --- task issues: owner-filed work orders (launch from the phone) ---
     tasks = gh_json(["gh", "issue", "list", "--label", "task",
@@ -778,19 +1235,22 @@ def tick(dry):
                       "No action needed — next update when a PR opens.",
                       tags="rocket", url=issue.get("url"))
         note = STASH_NOTE if state.get("stash_note_pending") else ""
-        code = run_session("impl", TASK_PROMPT.format(
+        res = run_session("impl", TASK_PROMPT.format(
             number=n, title=issue["title"], body=body, comments=ctext) + note)
-        if code is None:
+        if res is None:
             return "abort"
+        if res.quota or res.budget:
+            state["launched_tasks"].remove(n)  # retry after the pause
+            return pause_for_quota_or_budget(state, res, dry)
         key = f"task #{n}"
-        if code == 0:
+        if res.code == 0:
             state["failures"].pop(key, None)
             state.pop("stash_note_pending", None)
             request_publish()
         else:
             fails = state["failures"].get(key, 0) + 1
             state["failures"][key] = fails
-            log(f"task session failed (exit {code}); failures: {fails}")
+            log(f"task session failed (exit {res.code}); failures: {fails}")
             if fails < FAIL_STRIKES:
                 # Feed the failure back: a diagnosis task issue gives the
                 # loop one self-fix attempt before human escalation.
@@ -817,6 +1277,8 @@ def tick(dry):
     prs = open_prs()
     if prs is None:
         return "abort"
+    if briefing:
+        briefing.cleanup_briefings([p["number"] for p in prs])
     for p in prs:
         if p["number"] not in state["seen_prs"]:
             state["seen_prs"].append(p["number"])
@@ -869,8 +1331,15 @@ def tick(dry):
                     if dry:
                         log(f"would run CI fix session for PR #{p['number']}")
                     else:
-                        run_session("impl", CI_FIX_PROMPT.format(
-                            number=p["number"], title=p["title"]))
+                        ci_note = (briefing.prepare_briefings([p["number"]])
+                                   if briefing else "")
+                        res = run_session("impl", CI_FIX_PROMPT.format(
+                            number=p["number"], title=p["title"]) + ci_note)
+                        if res is not None and (res.quota or res.budget):
+                            # the fix session never ran; do not burn the
+                            # one-shot budget or invalidate approvals
+                            state["ci_fix_tried"].remove(p["number"])
+                            return pause_for_quota_or_budget(state, res, dry)
                         # The fix pushed new code: re-verify correctness
                         # before it can merge (same rule as rework).
                         run(["gh", "pr", "edit", str(p["number"]),
@@ -915,20 +1384,25 @@ def tick(dry):
                 state["qa_strikes"].pop(str(p["number"]), None)
                 state["approved_prs"] = [n for n in state["approved_prs"]
                                          if n != p["number"]]
+                state["ci_failed_prs"] = [n for n in state.get("ci_failed_prs", [])
+                                          if n != p["number"]]
                 notify.notify(f"{REPO_NAME}: PR merged",
                               f"#{p['number']} {p['title']}\n\n"
                               "Outputs will be published to Nextcloud "
                               "Documents/04_projects/ within ~5 min. "
                               "No action needed.",
                               tags="white_check_mark", url=p.get("url"))
-                # Delivery complete for this PR: verify scope + storage.
-                if p["number"] not in state["verified_merges"]:
+                # Merged work: re-verify before the repo goes idle again.
+                state["verified_idle"] = False
+                # Per-merge verification is off by default (cost control,
+                # issue #16): the once-per-idle verification covers it.
+                # Set DISPATCH_VERIFY_PER_MERGE=1 to restore it.
+                if VERIFY_PER_MERGE and p["number"] not in state["verified_merges"]:
                     state["verified_merges"].append(p["number"])
-                    state["verified_idle"] = False
                     maybe_save(state, dry)
                     verify_delivery(
                         f"PR #{p['number']} ({p['title']}) just merged to main",
-                        dry)
+                        dry, state)
             else:
                 waiting = True
                 if p["number"] not in state["merge_failed_prs"]:
@@ -951,15 +1425,34 @@ def tick(dry):
                 targets = corr
             else:
                 role, prompt, label = "adv", ADV_PROMPT, ADV_LABEL
-                targets = in_review
+                # Fast lane: engine syncs carry code already adversarially
+                # reviewed in pennico-ops — no second review session per
+                # project repo, just the label so the PR can merge.
+                auto = [p for p in in_review if is_engine_sync(p["number"])]
+                for p in auto:
+                    log(f"PR #{p['number']}: engine sync — fast lane, "
+                        "no adversarial session")
+                    if not dry:
+                        run(["gh", "pr", "edit", str(p["number"]),
+                             "--add-label", ADV_LABEL])
+                targets = [p for p in in_review if p not in auto]
+                if not targets:
+                    maybe_save(state, dry)
+                    return "worked"
             log(f"PRs needing {role} review: {[p['number'] for p in targets]}")
             if dry:
                 maybe_save(state, dry)
                 return "worked"
             maybe_save(state, dry)
-            code = run_session(role, prompt)
-            if code is None:
+            review_note = briefing.prepare_briefings(
+                [p["number"] for p in targets]) if briefing else ""
+            res = run_session(role, prompt + review_note)
+            if res is None:
                 return "abort"
+            if res.quota or res.budget:
+                # a quota death is not a failed review: no strikes, no
+                # rework, no blocker — pause and retry after the cooldown
+                return pause_for_quota_or_budget(state, res, dry)
             pause = False
             for p in targets:
                 n = p["number"]
@@ -968,14 +1461,18 @@ def tick(dry):
                     return "abort"
                 if label in after:
                     state["qa_strikes"].pop(str(n), None)
+                    if label == "approved" and is_engine_sync(n):
+                        log(f"PR #{n}: engine sync passed QA — fast lane to merge")
+                        run(["gh", "pr", "edit", str(n), "--add-label", ADV_LABEL])
                     continue
                 strikes = state["qa_strikes"].get(str(n), 0) + 1
                 state["qa_strikes"][str(n)] = strikes
-                if strikes > QA_STRIKES:
+                cap = 1 if is_engine_sync(n) else QA_STRIKES
+                if strikes > cap:
                     log(f"PR #{n} failed review after rework rounds; pausing")
                     b = file_blocker(
                         f"PR #{n} failed review after rework rounds: {p['title']}",
-                        f"This PR failed {QA_STRIKES} review rounds (label "
+                        f"This PR failed {cap} review round(s) (label "
                         f"`{label}` not added; see the PR review comments), "
                         "each followed by a rework session. The dispatcher "
                         "paused this repo. Please take a look, then comment "
@@ -992,8 +1489,43 @@ def tick(dry):
                     pause = True
                     continue
                 log(f"PR #{n} failed {role} review (strike {strikes}); launching rework")
-                run_session("impl", REWORK_PROMPT.format(
-                    number=n, title=p["title"]))
+                head_before = pr_head(n)
+                rework_note = (briefing.prepare_briefings([n])
+                               if briefing else "")
+                res = run_session("impl", REWORK_PROMPT.format(
+                    number=n, title=p["title"]) + rework_note)
+                if res is not None and (res.quota or res.budget):
+                    # rework could not run: undo this round's strike (the
+                    # round restarts after the pause) and stop the tick
+                    state["qa_strikes"][str(n)] = strikes - 1
+                    return pause_for_quota_or_budget(state, res, dry)
+                if (res is not None and res.code == 0
+                        and pr_head(n) == head_before):
+                    # The rework session finished but pushed nothing:
+                    # another round would repeat the same review on the
+                    # same code — the loop is going in circles (this is
+                    # the "running for nothing" pattern from 2026-10-06).
+                    log(f"PR #{n}: rework made no progress; escalating")
+                    b = file_blocker(
+                        f"PR #{n} rework made no progress: {p['title']}",
+                        f"The rework session after a failed review finished "
+                        f"without pushing any new commits to PR #{n}. "
+                        "Repeating the review would loop on the same code, "
+                        "so the dispatcher paused this repo. Please take a "
+                        "look at the PR and the review comments, then "
+                        "comment here and add the `answered` label to "
+                        "resume.")
+                    if b:
+                        state["seen_blockers"].append(b)
+                        notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                      f"#{b} {p['title']}\n\n"
+                                      f"PR #{n}: rework pushed no changes. "
+                                      "Comment on the issue and add the "
+                                      "`answered` label (or reply here) "
+                                      "to resume.",
+                                      priority="high", tags="warning", url=p.get("url"))
+                    pause = True
+                    continue
                 if "approved" in after:
                     run(["gh", "pr", "edit", str(n), "--remove-label", "approved"])
                     log(f"PR #{n}: removed `approved` (code changed in rework)")
@@ -1035,17 +1567,19 @@ def tick(dry):
             return "worked"
         maybe_save(state, dry)
         note = STASH_NOTE if state.get("stash_note_pending") else ""
-        code = run_session(role, PROMPTS[role].format(item=item) + note)
-        if code is None:
+        res = run_session(role, PROMPTS[role].format(item=item) + note)
+        if res is None:
             return "abort"
-        if code == 0:
+        if res.quota or res.budget:
+            return pause_for_quota_or_budget(state, res, dry)
+        if res.code == 0:
             state["failures"].pop(item, None)
             state.pop("stash_note_pending", None)
             request_publish()
         else:
             fails = state["failures"].get(item, 0) + 1
             state["failures"][item] = fails
-            log(f"session failed (exit {code}); failures for this item: {fails}")
+            log(f"session failed (exit {res.code}); failures for this item: {fails}")
             if fails < FAIL_STRIKES:
                 # Feed the failure back: a diagnosis task issue gives the
                 # loop one self-fix attempt before human escalation.
@@ -1086,9 +1620,11 @@ def tick(dry):
     if not state.get("verified_idle"):
         state["verified_idle"] = True
         maybe_save(state, dry)
-        verify_delivery(
-            "the roadmap is complete, all PRs are merged, and the repo is idle",
-            dry)
+        if not verify_delivery(
+                "the roadmap is complete, all PRs are merged, and the repo is idle",
+                dry, state):
+            state["verified_idle"] = False  # session did not run; retry later
+            maybe_save(state, dry)
     maybe_save(state, dry)
     return "idle"
 
@@ -1110,6 +1646,7 @@ def main():
     loop = "--loop" in sys.argv
     signal.signal(signal.SIGTERM, _request_shutdown)
     LOGDIR.mkdir(exist_ok=True)
+    rotate_logs()
     lock = acquire_lock()
     if lock is None:
         log("another dispatcher tick is already running; skipping")

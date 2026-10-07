@@ -17,10 +17,9 @@ anyone launching sessions manually.
 4. No PRs -> Implementation session on the first unchecked ROADMAP.md item
    (every chunk is an [impl] session).
 5. Roadmap complete -> idle + one "roadmap done" notification.
-6. Delivery verification: when the loop considers the delivery complete
-   (a PR merged, and once per idle period), a verification session asks
-   "Has the project fulfilled its scope and are all the deliverables
-   completed, and stored correctly?" — gaps come back as `[verify]` task
+6. Delivery verification: once per idle period, a verification session
+   asks "Has the project fulfilled its scope and are all the
+   deliverables completed, and stored correctly?" — gaps come back as `[verify]` task
    issues the loop schedules fixes for; a clean pass notifies the owner.
    An approved PR with red CI gets one automatic fix session (the fix
    re-enters the review pipeline) before the dispatcher escalates to a
@@ -43,6 +42,26 @@ the dispatcher files a blocker issue and pauses the repo; the owner's
 answer on that issue resumes with a fresh budget. QA has the same budget:
 2 QA passes on the same PR without approval -> blocker issue + pause.
 
+## Context diet (per-session data pull)
+
+Cached tokens dominate usage, and the measured top filler is the same
+text re-fetched by every session (one PR diff was pulled 5+ times across
+a single rework cycle on 2026-10-06). The engine now:
+
+- **Writes per-PR briefing files** (`dispatcher/briefings/pr-<n>.md`,
+  gitignored) before each review/rework/CI-fix session — diff +
+  comments + metadata fetched once per tick — and appends a prompt note
+  pointing the session at them instead of `gh pr diff` /
+  `gh pr view --comments`. Best-effort: a failed fetch falls back to
+  the session fetching itself. Briefings for closed PRs are removed
+  each tick.
+- **Rotates session logs**: transcripts gzip after 7 days, are deleted
+  after 30 (`rotate_logs()` at dispatcher start).
+
+The matching session norms (targeted reads, one full doc read per
+session, short status docs) are in `AGENTIC_WORK_STANDARDS.md` under
+"Context discipline".
+
 ## Notifications
 
 `dispatcher/notify.py` sends push notifications via ntfy (outbound HTTPS
@@ -53,21 +72,34 @@ budget hit (high), roadmap done (high), PR opened/approved/merged
 (default). Failures to send are logged, never fatal — GitHub issues are
 the durable record.
 
-## Cost cap
+## Cost controls
 
-Sessions run with `--max-price $DISPATCH_MAX_PRICE` (default 10) plus
-`--max-turns 150` and a 90-minute timeout. The cap is a runaway guard, not
-a budget target; after the first supervised runs, calibrate it to roughly
-2x the observed cost of a normal session (token usage is in the session
-JSON logs).
+- Sessions run with `--max-price $DISPATCH_MAX_PRICE` (default 10) plus a
+  90-minute timeout. The cap is a runaway guard, not a budget target;
+  after the first supervised runs, calibrate it to roughly 2x the
+  observed cost of a normal session (token usage is in the session
+  JSON logs).
+- Implementation sessions run `--max-turns 150`; qa/adversarial/verify
+  sessions run `--max-turns $DISPATCH_MAX_TURNS_REVIEW` (default 60).
+- Every session launch checks and increments a shared daily counter
+  (`<projects>/.session-budget.json`, all repos, one budget). At
+  `DISPATCH_DAILY_SESSIONS` (default 14) no sessions launch for the rest
+  of the day; the owner is notified once.
+- A session that dies on an API-limit signature (HTTP 402/429, quota,
+  rate limit, ...) is not a real failure: no strike, no rework, no
+  blocker — the repo pauses for `DISPATCH_QUOTA_COOLDOWN_S` (default
+  6h) and retries automatically. GitHub's own rate limits (gh CLI,
+  api.github.com) are the exception (issue #9): they clear in minutes,
+  so they count a normal strike — after 2 strikes the diagnosis issue
+  reaches the owner — and never trigger the 6-hour pause.
 
 ## Guardrails
 
 - `.vibe/hooks.toml` + `.vibe/guard.py` deny destructive bash commands
   (force-push, reset --hard, rm -rf, sudo, pipe-to-shell) and any agent
   access to `.env`. Loaded because the dispatcher passes `--trust`.
-- Sessions run with `--auto-approve --max-turns 150 --max-price ...` and a
-  90-minute timeout; output is captured, never interactive.
+- Sessions run with `--auto-approve --max-turns ... --max-price ...` and
+  a 90-minute timeout; output is captured, never interactive.
 - The dispatcher never force-pushes, never merges unapproved PRs, and
   aborts on a dirty tree.
 
