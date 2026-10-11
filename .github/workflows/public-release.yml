@@ -1,0 +1,72 @@
+name: Rebuild public-release branch
+
+# Mirrors pennico/tts-ereader's public-release workflow: every push to
+# main rebuilds the public-release branch as an orphan squash with
+# agent-ops plumbing dropped (.vibe/, dispatcher/). Planning docs
+# (AGENTS.md, PLAN.md, ROADMAP.md, STATUS.md) stay in - they are
+# referenced from public files (README.md, geotag.py) and contain no
+# personal info; the sensitivity scan below covers them.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}   # manual rebuild from the Actions tab
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 5
+          path: repo
+
+      - name: Sensitivity scan of the tree to publish
+        working-directory: repo
+        env:
+          # Extra private patterns live in the repository variable
+          # PRIVATE_PATTERNS (never in this file — it is published).
+          EXTRA: ${{ vars.PRIVATE_PATTERNS }}
+        run: |
+          PATTERNS='192\.168\.[0-9]|AIza[A-Za-z0-9_-]{10}|AQ\.[A-Za-z0-9_-]{10}|pennico-ops'
+          if [ -n "$EXTRA" ]; then PATTERNS="${PATTERNS}|${EXTRA}"; fi
+          LEAKS=$(grep -rniE "$PATTERNS" \
+            --include='*.py' --include='*.md' --include='*.yml' \
+            --include='*.sql' --include='*.toml' --include='*.json' \
+            --include='*.example' --include='*.sh' . \
+            | grep -v '^\./dispatcher/\|^\./\.vibe/\|^\./\.github/' \
+            | head -5 || true)
+          if [ -n "$LEAKS" ]; then
+            echo "Private patterns found in the tree to publish:" >&2
+            echo "$LEAKS" >&2
+            exit 1
+          fi
+
+      - name: Orphan-squash onto public-release
+        working-directory: repo
+        run: |
+          git rm -rq --cached . >/dev/null 2>&1 || true
+          rm -rf .vibe dispatcher
+          rm -f .github/workflows/public-release.yml  # not part of the public repo
+          git checkout -q --orphan pubrel-tmp
+          git add -A
+          git -c user.name=pennico -c user.email=pennico@users.noreply.github.com \
+            commit -q -m "immich-geotag: fill missing GPS coordinates in Immich by recognizing landmarks"
+          git branch -M public-release
+          git push --force origin public-release
+
+      - name: Report failure as an issue (the loop notifies the owner)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh label create blocker --color D93F0B 2>/dev/null || true
+          gh issue create --label blocker \
+            --title "public-release rebuild failed (auto)" \
+            --body "The push-triggered public-release rebuild workflow failed. See the run in the Actions tab. Comment here and add the answered label once resolved."
