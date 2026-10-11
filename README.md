@@ -16,6 +16,14 @@ photo without GPS  →  landmark recognition (Vision / Lens / Gemini)
 
 Design and history: `PLAN.md`.
 
+## Status
+
+In production use on the author's own Immich library. The base pipeline
+is stable and fully tested (161 tests); the monthly runner is deployed
+as a cron job and stays inside the Vision free tier; the
+visual-similarity and Gemini extension passes are active. Coordinates
+are add-only — nothing is ever modified or deleted.
+
 ## Requirements and install
 
 - Python 3.9+ — stdlib only, no third-party packages to install.
