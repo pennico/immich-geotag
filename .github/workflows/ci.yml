@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install tools
-        run: pip install ruff pytest
+        run: pip install -r requirements-dev.txt
       - name: Lint
         run: ruff check .
       - name: Tests
