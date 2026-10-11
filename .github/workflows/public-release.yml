@@ -2,10 +2,11 @@ name: Rebuild public-release branch
 
 # Mirrors pennico/tts-ereader's public-release workflow: every push to
 # main rebuilds the public-release branch as an orphan squash with
-# agent-ops plumbing dropped (.vibe/, dispatcher/). Planning docs
-# (AGENTS.md, PLAN.md, ROADMAP.md, STATUS.md) stay in - they are
-# referenced from public files (README.md, geotag.py) and contain no
-# personal info; the sensitivity scan below covers them.
+# agent-ops files dropped (.vibe/, dispatcher/, AGENTS.md, STATUS.md -
+# the latter two reference the private pennico-ops repo). PLAN.md and
+# ROADMAP.md stay in - they are referenced from public files
+# (README.md, geotag.py), contain no private patterns, and the
+# sensitivity scan below covers them.
 
 on:
   push:
@@ -39,7 +40,7 @@ jobs:
             --include='*.py' --include='*.md' --include='*.yml' \
             --include='*.sql' --include='*.toml' --include='*.json' \
             --include='*.example' --include='*.sh' . \
-            | grep -v '^\./dispatcher/\|^\./\.vibe/\|^\./\.github/' \
+            | grep -v '^\./dispatcher/\|^\./\.vibe/\|^\./\.github/\|^\./AGENTS.md\|^\./STATUS.md' \
             | head -5 || true)
           if [ -n "$LEAKS" ]; then
             echo "Private patterns found in the tree to publish:" >&2
@@ -51,7 +52,7 @@ jobs:
         working-directory: repo
         run: |
           git rm -rq --cached . >/dev/null 2>&1 || true
-          rm -rf .vibe dispatcher
+          rm -rf .vibe dispatcher AGENTS.md STATUS.md
           rm -f .github/workflows/public-release.yml  # not part of the public repo
           git checkout -q --orphan pubrel-tmp
           git add -A
