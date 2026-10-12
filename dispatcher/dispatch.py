@@ -12,16 +12,22 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
        - blocker with the `answered` label (owner commented + labeled) or
          closed by the owner -> resume: launch a session with the issue
          number and the owner's answer quoted in the prompt.
-  3. Task issues (open, label `task`) are owner-filed work orders — the
+  3. Run issues (open, label `run`) are direct script jobs — no session.
+     Executed BEFORE the blocker gate and the quota/budget pauses:
+     calendar jobs (monthly backfills) must fire on schedule even
+     while the repo waits on an unanswered blocker; they carry their
+     own budgets. A run issue that failed already carries the `blocker`
+     label and is skipped here, so it is not retried every tick.
+  4. Task issues (open, label `task`) are owner-filed work orders — the
      way to launch work from the phone. First unlaunched task -> one
      session with the issue body and comments as the prompt. Two failed
      task sessions -> the issue gains the `blocker` label and the repo
      pauses.
-  4. Main-branch CI: the latest run on main is checked every tick. A
+  5. Main-branch CI: the latest run on main is checked every tick. A
      red run gets one automatic fix session (pushed straight to main);
      FAIL_STRIKES consecutive red fixes -> blocker + pause. A green run
      resets the budget.
-  5. If open PRs exist:
+  6. If open PRs exist:
        - merge PRs with BOTH review labels (`approved` + `approved-adversarial`)
          and green checks first (squash, delete branch);
        - two-reviewer pipeline, one review session per tick: a PR lacking
@@ -31,9 +37,9 @@ or aborted. run.sh prevents overlapping invocations. State machine per tick:
          the PR (impl role, addresses the review comments) and invalidates
          prior approvals. Two failed review rounds on the same PR ->
          blocker + pause.
-  6. Else: run an Implementation session on the first unchecked ROADMAP.md
+  7. Else: run an Implementation session on the first unchecked ROADMAP.md
      item (a role tag in the item text selects the prompt; default impl).
-  7. Else: idle (roadmap complete) -> notify once.
+  8. Else: idle (roadmap complete) -> notify once.
 
 Delivery verification: when the loop considers the delivery complete —
 once per idle period (per-merge verification is available behind
@@ -468,7 +474,8 @@ def task_issues():
 def run_issues():
     """Open issues labeled `run`: direct script jobs, no LLM session."""
     return gh_json(["gh", "issue", "list", "--label", "run",
-                    "--state", "open", "--json", "number,title,body"]) or []
+                    "--state", "open",
+                    "--json", "number,title,body,labels"]) or []
 
 
 def execute_run_issue(issue, dry):
@@ -1101,6 +1108,18 @@ def tick(dry):
                               "on the issue and add the `answered` label — "
                               "the loop resumes within ~5 min.",
                               priority="high", tags="warning", url=issue.get("url"))
+    # --- run issues: direct script jobs, no LLM session ---
+    # Before the blocker gate and the session pauses: calendar jobs
+    # (monthly backfills) must fire on schedule even while the repo
+    # waits on an unanswered blocker — they run no agent session and
+    # carry their own budgets. A failed run issue already carries the
+    # `blocker` label (added by execute_run_issue) and is skipped here
+    # so it is not retried every tick.
+    for issue in run_issues():
+        if "blocker" in {l["name"] for l in issue.get("labels", [])}:
+            continue
+        maybe_save(state, dry)
+        return execute_run_issue(issue, dry)
     actionable, open_unanswered = [], []
     for issue in blockers:
         labels = {l["name"] for l in issue["labels"]}
@@ -1225,13 +1244,6 @@ def tick(dry):
                         request_publish()
                     maybe_save(state, dry)
                     return "worked"
-
-    # --- run issues: direct script jobs, no LLM session ---
-    # GitHub is the only trigger bus: scheduled Actions file `run`
-    # issues instead of host cron entries starting agent work.
-    for issue in run_issues():
-        maybe_save(state, dry)
-        return execute_run_issue(issue, dry)
 
     # --- task issues: owner-filed work orders (launch from the phone) ---
     tasks = gh_json(["gh", "issue", "list", "--label", "task",
