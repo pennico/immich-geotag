@@ -4,7 +4,7 @@ Current state, kept short on purpose: this is the file routine agent
 sessions read first. `PLAN.md` is the frozen design/history reference —
 read it in ranges (grep / line ranges), not in full.
 
-Last updated: 2026-10-08.
+Last updated: 2026-10-12.
 
 ## Done and merged
 
@@ -28,6 +28,11 @@ Last updated: 2026-10-08.
   `--limit N` launch the job; AGENTS.md network note corrected (live
   credentials ARE present; agents never run the live scripts).
   9 tests in `test_monthly_geotag.py`.
+- Public-release blocker (issue #20) resolved by PR #21: AGENTS.md and
+  STATUS.md are stripped from the published tree; the rebuild workflow
+  has run green on every merge since (PRs #21–#23). Verified 2026-10-12:
+  `origin/public-release` tree contains neither file and the last
+  rebuild run succeeded.
 
 ## In flight
 
