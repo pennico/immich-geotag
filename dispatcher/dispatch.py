@@ -936,7 +936,9 @@ def run_session(role, prompt):
     # The discipline preamble rides along on every launch: the binding
     # point that reaches the model without depending on it reading
     # AGENTS.md or the standards doc first.
-    cmd = ["vibe", "-p", prompt + SPENDING_DISCIPLINE,
+    import memory  # local import: dispatcher dir is on sys.path; best-effort
+    scope = "ops." + REPO_NAME
+    cmd = ["vibe", "-p", prompt + SPENDING_DISCIPLINE + memory.block(scope),
            "--auto-approve", "--trust",
            "--max-turns", max_turns, "--max-price", MAX_PRICE,
            "--output", "json"]
@@ -972,6 +974,8 @@ def run_session(role, prompt):
     quota = is_quota_failure(code, stderr or "")
     log(f"{role} session finished, exit {code}"
         + (" (API quota/limit signature)" if quota else ""))
+    memory.save(scope, "session", f"{role} exit {code}"
+                + (" (quota)" if quota else ""))
     if _shutdown["requested"]:
         raise Shutdown()
     return SessionResult(code, quota=quota)
