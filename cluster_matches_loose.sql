@@ -1,9 +1,9 @@
--- cluster_matches.sql: visually similar located photos for every
+-- cluster_matches_loose.sql: visually similar located photos for every
 -- unlocated image, via Immich's CLIP embeddings (smart_search, pgvector).
 --
 -- Run on the host running the Immich postgres container (read-only):
 --   docker exec -i immich_postgres psql -U postgres -d immich -At \
---     < cluster_matches.sql > matches.csv
+--     < cluster_matches_loose.sql > matches_loose.csv
 --
 -- Output (CSV, no header, positional - see cluster_fill.py MATCH_COLUMNS):
 --   asset_id, file_name, taken_at, match_id, match_name, match_taken_at,
@@ -12,7 +12,7 @@
 --    when the EXIF date is missing; used by the time-coherence rule)
 --
 -- For every IMAGE asset without GPS, the top 10 located images with
--- cosine similarity >= 0.85 (distance < 0.20). The <=> operator uses the
+-- cosine similarity >= 0.80 (distance < 0.20). The <=> operator uses the
 -- ANN index when present; the distance filter keeps the result small.
 
 COPY (

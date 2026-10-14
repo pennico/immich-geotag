@@ -1,9 +1,9 @@
--- cluster_matches.sql: visually similar located photos for every
+-- cluster_matches_vloose.sql: visually similar located photos for every
 -- unlocated image, via Immich's CLIP embeddings (smart_search, pgvector).
 --
 -- Run on the host running the Immich postgres container (read-only):
 --   docker exec -i immich_postgres psql -U postgres -d immich -At \
---     < cluster_matches.sql > matches.csv
+--     < cluster_matches_vloose.sql > matches_vloose.csv
 --
 -- Output (CSV, no header, positional - see cluster_fill.py MATCH_COLUMNS):
 --   asset_id, file_name, taken_at, match_id, match_name, match_taken_at,
