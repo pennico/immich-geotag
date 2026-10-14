@@ -4,7 +4,7 @@ Current state, kept short on purpose: this is the file routine agent
 sessions read first. `PLAN.md` is the frozen design/history reference —
 read it in ranges (grep / line ranges), not in full.
 
-Last updated: 2026-10-12.
+Last updated: 2026-10-14.
 
 ## Done and merged
 
@@ -33,6 +33,13 @@ Last updated: 2026-10-12.
   has run green on every merge since (PRs #21–#23). Verified 2026-10-12:
   `origin/public-release` tree contains neither file and the last
   rebuild run succeeded.
+- Issue #27 (delivery-verification gap): the dispatcher test suite is
+  now hermetic — the `env` fixture mocks `memory.block`/`memory.save`
+  so no test reads or writes the live agent-memory service — and
+  `test_run_session_binds_spending_discipline` matches the prompt
+  contract from 810748f (discipline text present on every launch,
+  memory block after it; empty-memory variant keeps the old tail).
+  Full suite 300 green with MEMORY_URL set and a populated scope.
 
 ## In flight
 

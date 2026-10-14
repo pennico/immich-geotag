@@ -11,6 +11,7 @@ import time
 from types import SimpleNamespace
 
 import dispatch
+import memory
 import pytest
 
 
@@ -58,6 +59,14 @@ def env(tmp_path, monkeypatch):
     if dispatch.feedback is not None:
         monkeypatch.setattr(dispatch.feedback, "report",
                             lambda *a, **k: e.reports.append(a))
+    # Hermetic agent-memory: run_session reads memory.block into every
+    # launch prompt and writes memory.save after every session, so both
+    # must stay off the live service in tests. The canned block is
+    # non-empty to match the deployment's steady state (the scope has
+    # entries), which is where the old endswith assertion broke.
+    e.mem_block = "\n- 10-13 (session) qa exit 0\n"
+    monkeypatch.setattr(memory, "block", lambda scope, n=5: e.mem_block)
+    monkeypatch.setattr(memory, "save", lambda *a, **k: None)
     e.launches = []      # (role, prompt) per run_session call
     e.results = {}       # role -> SessionResult, or callable(role, prompt)
     e.popen_cmds = []
@@ -508,6 +517,10 @@ def test_env_overrides(monkeypatch):
 def test_run_session_binds_spending_discipline(env, monkeypatch):
     # The discipline preamble must ride on EVERY launch (the binding
     # point that reaches the model without it reading AGENTS.md first).
+    # Since 810748f the recent-memory block is appended after it, so
+    # with memory entries present (the deployment steady state, canned
+    # in the env fixture) the prompt ends with the memory block, not
+    # with the discipline tail.
     e = env
     seen = []
     monkeypatch.setattr(dispatch.subprocess, "Popen",
@@ -518,4 +531,18 @@ def test_run_session_binds_spending_discipline(env, monkeypatch):
     for cmd in seen:
         assert "Spending discipline (binding, every session)" in cmd[2]
         assert "head -c 20000" in cmd[2]
-        assert cmd[2].endswith("over exploring broadly.")
+        assert cmd[2].startswith("p" + dispatch.SPENDING_DISCIPLINE)
+        assert cmd[2].endswith(e.mem_block)
+
+
+def test_run_session_prompt_without_memory_ends_with_discipline(env,
+                                                                monkeypatch):
+    # Empty memory service: the prompt falls back to ending with the
+    # discipline tail (the pre-agent-memory shape).
+    e = env
+    e.mem_block = ""
+    seen = []
+    monkeypatch.setattr(dispatch.subprocess, "Popen",
+                        lambda cmd, **k: seen.append(cmd) or FakeProc())
+    e.run_session("impl", "p")
+    assert seen[0][2].endswith("over exploring broadly.")
