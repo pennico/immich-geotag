@@ -45,12 +45,12 @@ class TestCompactRows(unittest.TestCase):
         self.assertEqual(len(out), len(cluster_review_app.FIELDS) + 2)
 
     def test_dt_minutes_computed(self):
-        rows = [row(taken="2026-03-15 12:00", match_taken="2026-03-15 12:05")]
+        rows = [row(taken="2001-05-15 12:00", match_taken="2001-05-15 12:05")]
         out = cluster_review_app.compact_rows(rows)[0]
         self.assertEqual(out[15], 5.0)
 
     def test_dt_ignored_when_timestamps_missing(self):
-        rows = [row(taken="2026-03-15 12:00")]
+        rows = [row(taken="2001-05-15 12:00")]
         out = cluster_review_app.compact_rows(rows)[0]
         self.assertIsNone(out[15])
 
