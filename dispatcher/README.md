@@ -208,14 +208,22 @@ file with its return code, and the runner's cron/supervisor log.
 
 **Trusted authors.** The project repos are public, so anyone can open a
 fork PR, file an issue, or comment. The tick only acts on input from
-`DISPATCH_TRUSTED_AUTHORS` (comma-separated logins, default
-`pennico,app/github-actions,github-actions`):
+`DISPATCH_TRUSTED_AUTHORS` (comma-separated logins, default: the owner,
+the agent account `pennico-agent` and GitHub Actions):
 
 - open PRs: only same-repo branches by a trusted author (fork PRs are
   never reviewed, tested, or merged);
-- `run` and `task` issues: only when opened by a trusted author;
-- blocker answers, task-issue comments and PR briefings: only trusted
-  authors' comments reach a session prompt.
+- `task` issues: only when opened by a trusted author;
+- task-issue comments and PR briefings: only trusted authors' comments
+  reach a session prompt.
+
+**Owner-only.** Agent sessions act as their own machine user
+(`pennico-agent`), the owner as `pennico` (`DISPATCH_OWNER_AUTHORS`).
+Only the owner can answer a blocker (the answer is the owner's last
+comment; an `answered` label without an owner comment is removed and
+ignored) or open a `run` issue (also allowed: scheduled GitHub Actions).
+The Telegram bridge posts the owner's replies with `OWNER_GH_TOKEN`, so
+they count as the owner.
 
 Residual: a session that falls back to `gh pr view --comments` itself
 still sees every comment. Keep repo interaction limits on if a PR thread
