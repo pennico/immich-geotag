@@ -627,3 +627,87 @@ def test_trusted_authors_env_override(monkeypatch):
     finally:
         monkeypatch.delenv("DISPATCH_TRUSTED_AUTHORS")
         importlib.reload(dispatch)
+
+
+# --- agent backend switch (AGENT_BACKEND, agent_backend.py) ---
+
+def _budget_sessions():
+    data = json.loads(dispatch.BUDGET_FILE.read_text())
+    return next(iter(data.values()))["sessions"]
+
+
+def test_both_mode_falls_back_on_quota_in_one_slot(env, monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "both")
+    seen = []
+    procs = [FakeProc(code=1, err="Error: API error occurred: Status 429"),
+             FakeProc(code=0, out='{"type":"result","is_error":false,'
+                                  '"result":"done","total_cost_usd":1.5}')]
+    monkeypatch.setattr(dispatch.subprocess, "Popen",
+                        lambda cmd, **k: seen.append(cmd) or procs.pop(0))
+    res = env.run_session("impl", "p")
+    assert [c[0] for c in seen] == ["vibe", "claude"]
+    assert res.code == 0 and res.quota is False and res.backend == "claude"
+    assert _budget_sessions() == 1  # the fallback reuses the slot
+
+
+def test_both_mode_quota_on_both_backends_pauses(env, monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "both")
+    procs = [FakeProc(code=1, out='{"is_error":true,"api_error_status":429}'),
+             FakeProc(code=1, err="HTTP 402 Payment Required")]
+    monkeypatch.setattr(dispatch.subprocess, "Popen",
+                        lambda cmd, **k: procs.pop(0))
+    res = env.run_session("adv", "p")   # claude first for adv
+    assert res.quota is True and res.backend == "vibe"
+
+
+def test_both_mode_real_failure_does_not_fall_back(env, monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "both")
+    seen = []
+    monkeypatch.setattr(dispatch.subprocess, "Popen",
+                        lambda cmd, **k: seen.append(cmd)
+                        or FakeProc(code=1, err="ValueError: bad arg"))
+    res = env.run_session("impl", "p")
+    assert len(seen) == 1 and res.code == 1 and res.quota is False
+
+
+def test_both_mode_falls_back_when_cli_missing(env, monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "both")
+    seen = []
+
+    def popen(cmd, **k):
+        seen.append(cmd[0])
+        if cmd[0] == "claude":
+            raise FileNotFoundError
+        return FakeProc(code=0)
+    monkeypatch.setattr(dispatch.subprocess, "Popen", popen)
+    res = env.run_session("verify", "p")
+    assert seen == ["claude", "vibe"] and res.backend == "vibe"
+    assert _budget_sessions() == 1
+
+
+def test_no_backend_cli_releases_the_slot(env, monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "both")
+
+    def popen(cmd, **k):
+        raise FileNotFoundError
+    monkeypatch.setattr(dispatch.subprocess, "Popen", popen)
+    assert env.run_session("impl", "p") is None
+    assert _budget_sessions() == 0
+
+
+def test_claude_session_logs_match_role_glob(env, monkeypatch):
+    monkeypatch.setenv("AGENT_BACKEND", "claude")
+    monkeypatch.setattr(dispatch.subprocess, "Popen",
+                        lambda cmd, **k: FakeProc(code=0, out="{}"))
+    env.run_session("qa", "p")
+    exits = list(dispatch.LOGDIR.glob("*-qa.exit"))
+    assert len(exits) == 1 and "-claude-qa" in exits[0].name
+
+
+def test_vibe_session_gets_no_claude_token(env, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "secret")
+    envs = []
+    monkeypatch.setattr(dispatch.subprocess, "Popen",
+                        lambda cmd, **k: envs.append(k["env"]) or FakeProc())
+    env.run_session("impl", "p")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs[0]

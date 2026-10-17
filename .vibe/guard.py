@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """pre_tool guard for unattended runs: deny destructive bash commands and
 agent access to .env files. Receives the hook payload on stdin; emits a
-structured deny response on stdout, or exits 0 silently to allow."""
+structured deny response on stdout, or exits 0 silently to allow.
+
+The same guard backs Claude sessions (dispatcher/agent_backend.py registers it
+as a PreToolUse hook with --claude): Claude's tool names (Bash, Read,
+Write, Edit) map onto vibe's, and the deny is emitted in Claude's hook
+output format."""
 import json
 import re
 import sys
@@ -19,10 +24,19 @@ DENY_BASH = [
     r"\bwget\b[^|]*\|\s*(ba)?sh",
 ]
 ENV_PATH = re.compile(r"(^|/)\.env($|\.)")
+CLAUDE_TOOLS = {"Bash": "bash", "Read": "read_file", "Write": "write_file",
+                "Edit": "edit", "MultiEdit": "edit"}
+CLAUDE = "--claude" in sys.argv[1:]
 
 
 def deny(reason):
-    print(json.dumps({"decision": "deny", "reason": reason}))
+    if CLAUDE:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason}}))
+    else:
+        print(json.dumps({"decision": "deny", "reason": reason}))
 
 
 def main():
@@ -31,6 +45,8 @@ def main():
     except Exception:
         sys.exit(0)  # fail open on malformed input
     tool = hook.get("tool_name", "")
+    if CLAUDE:
+        tool = CLAUDE_TOOLS.get(tool, tool)
     inp = hook.get("tool_input") or {}
     if tool in ("read_file", "write_file", "edit"):
         path = str(inp.get("file_path", ""))

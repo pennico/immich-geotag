@@ -98,6 +98,45 @@ turns) mentions `arch` in every engine copy so the engine text stays
 identical across repos; in repos without the role it can never
 launch.
 
+## Agent backend (vibe / Claude / both)
+
+`dispatcher/agent_backend.py` picks the CLI per role. `AGENT_BACKEND`:
+
+| value | impl, arch, qa | adv, verify, overseer | fallback |
+|---|---|---|---|
+| `vibe` (default) | vibe | vibe | none |
+| `claude` | Claude | Claude | none |
+| `both` | vibe | Claude | the other backend, once |
+
+`AGENT_BACKEND_<ROLE>=vibe|claude` (IMPL, ARCH, QA, ADV, VERIFY) pins one role. In `both` mode a session that dies on an API
+limit (HTTP 402/429 signature) or whose CLI is missing is retried once
+on the other backend **in the same budget slot**; the repo enters the
+quota cooldown only when both died. A real failure (bad exit, timeout)
+is not retried.
+
+Claude sessions run `claude -p … --permission-mode dontAsk
+--allowedTools <list> --max-turns N --max-budget-usd
+$DISPATCH_MAX_PRICE --output-format json --no-session-persistence
+--settings <guard hook>`:
+
+- no prompts, and anything outside the allow-list
+  (`DISPATCH_CLAUDE_ALLOWED_TOOLS`, default in `agent_backend.py`: file
+  tools plus git/gh/python3/pytest/ruff and read-only shell tools) is
+  denied. The allow-list stops stray commands (curl, rm, …), but it is
+  **not a sandbox**: `python3` can do anything;
+- `.vibe/guard.py` runs as a PreToolUse hook (`--claude` output
+  mode), so Claude gets the same destructive-command and `.env` denies
+  as vibe;
+- never `--dangerously-skip-permissions`: GH_TOKEN and API keys are in
+  the environment;
+- auth: `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) or
+  `ANTHROPIC_API_KEY`. Vibe sessions get these removed from their
+  environment;
+- `DISPATCH_CLAUDE_MODEL` overrides the model (unset = CLI default);
+- logs: `<ts>-claude-<role>.json|.err|.exit`. The JSON is the result
+  object (reply, `total_cost_usd`, usage), and the cost is logged per
+  session.
+
 ## Tests
 
 `pytest dispatcher -q` (no network, no gh/git/vibe). The fixtures
