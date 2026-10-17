@@ -19,6 +19,13 @@ time_fill.apply_clusters (ledger + edit log updated, idempotent).
 Without the server the Apply button falls back to copying the selected
 cluster IDs.
 
+The server only binds 127.0.0.1 and guards POST /apply against
+cross-site requests from other pages open in the same browser: the
+request must carry the per-run token the server injects into the page it
+serves (X-Apply-Token header), a JSON Content-Type, a loopback Host
+header (DNS-rebinding guard), and - when the browser sends one - an
+Origin of this server.
+
 Usage:
   python3 time_fill_review_app.py [--recluster] [--limit N] [--skip-images]
   python3 time_fill_review_app.py --serve [--port 8788]
@@ -31,6 +38,7 @@ Usage:
 """
 import argparse
 import concurrent.futures
+import hmac
 import json
 import os
 import re
@@ -411,6 +419,9 @@ PAGE = """<!DOCTYPE html>
 const CLUSTERS = {rows};
 const SOURCE = "{source}";
 const SERVE_HINT = "{serve_hint}";
+// Per-run anti-CSRF token; only present when the page is served by --serve.
+const TOKEN_META = document.querySelector('meta[name="apply-token"]');
+const APPLY_TOKEN = TOKEN_META ? TOKEN_META.content : "";
 let selected = new Set();
 
 function esc(s) {{
@@ -516,7 +527,8 @@ document.getElementById("applyBtn").addEventListener("click", () => {{
   const ids = [...selected];
   fetch("/apply", {{
     method: "POST",
-    headers: {{"Content-Type": "application/json"}},
+    headers: {{"Content-Type": "application/json",
+               "X-Apply-Token": APPLY_TOKEN}},
     body: JSON.stringify({{clusters: ids}}),
   }}).then(r => r.json()).then(res => {{
     if (res.error) {{
@@ -673,12 +685,53 @@ def build(args):
     return clusters
 
 
-def serve(args):
-    """Serve the review app locally and expose POST /apply."""
+LOOPBACK_NAMES = ("127.0.0.1", "localhost")
+TOKEN_HEADER = "X-Apply-Token"
+
+
+def inject_token(html_bytes, token):
+    """Insert the per-run apply token as a <meta> tag right after <head>."""
+    meta = f'<meta name="apply-token" content="{token}">'.encode("ascii")
+    return html_bytes.replace(b"<head>", b"<head>" + meta, 1)
+
+
+def check_apply_request(headers, port, token):
+    """Validate a POST /apply request; return (status, error) or None if OK.
+
+    Blocks cross-site request forgery from any other page open in the
+    browser: such a page can send a "simple" POST without a preflight, but
+    it cannot read the token embedded in our page, cannot set a custom
+    header without a CORS preflight (which this server never answers), and
+    cannot make the browser send a matching Origin. The Host check stops
+    DNS-rebinding attacks that would otherwise make our origin look like
+    the attacker's.
+    """
+    allowed_hosts = {f"{h}:{port}" for h in LOOPBACK_NAMES}
+    host = (headers.get("Host") or "").strip().lower()
+    if host not in allowed_hosts:
+        return 403, "forbidden host"
+    origin = headers.get("Origin")
+    if origin is not None and origin.strip().lower() not in {
+            f"http://{h}" for h in allowed_hosts}:
+        return 403, "cross-origin request refused"
+    ctype = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if ctype != "application/json":
+        return 415, "Content-Type must be application/json"
+    sent = headers.get(TOKEN_HEADER) or ""
+    if not token or not hmac.compare_digest(sent.encode(), token.encode()):
+        return 403, "missing or invalid apply token"
+    return None
+
+
+def make_server(args, token, host="127.0.0.1"):
+    """Build (but do not start) the review-app HTTP server.
+
+    Serves args.out/index.html (with the apply token injected) and
+    args.out/images/, and exposes the guarded POST /apply.
+    """
     import http.server
     import urllib.parse
 
-    build(args)
     out_dir = os.path.abspath(args.out)
     index = os.path.join(out_dir, "index.html")
 
@@ -695,9 +748,10 @@ def serve(args):
             path = urllib.parse.urlparse(self.path).path
             if path in ("/", "/index.html"):
                 with open(index, "rb") as f:
-                    body = f.read()
+                    body = inject_token(f.read(), token)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -720,6 +774,11 @@ def serve(args):
         def do_POST(self):
             if urllib.parse.urlparse(self.path).path != "/apply":
                 self._send(404, '{"error": "not found"}')
+                return
+            refused = check_apply_request(
+                self.headers, self.server.server_address[1], token)
+            if refused:
+                self._send(refused[0], json.dumps({"error": refused[1]}))
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -746,8 +805,15 @@ def serve(args):
         def log_message(self, fmt, *a):
             print("%s - %s" % (self.address_string(), fmt % a))
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port),
-                                             Handler)
+    return http.server.ThreadingHTTPServer((host, args.port), Handler)
+
+
+def serve(args):
+    """Serve the review app locally and expose POST /apply."""
+    import secrets
+
+    build(args)
+    server = make_server(args, secrets.token_urlsafe(32))
     print(f"serving review app at http://127.0.0.1:{args.port}/ "
           f"(Ctrl-C to stop)")
     try:
