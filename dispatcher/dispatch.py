@@ -97,6 +97,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_backend as backend
 import notify
 
 try:
@@ -677,16 +678,18 @@ def recover_dirty_tree():
 class SessionResult:
     """Outcome of one session launch attempt.
 
-    code: the vibe exit code (124 on timeout), None if vibe never started.
+    code: the CLI exit code (124 on timeout), None if it never started.
     quota: the failure carries an API-limit signature (issue #15) — not a
         real failure; the loop pauses instead of burning failure budgets.
     budget: the shared daily session budget was spent; nothing launched.
+    backend: which CLI ran it ("vibe" or "claude"), None if none did.
     """
 
-    def __init__(self, code, quota=False, budget=False):
+    def __init__(self, code, quota=False, budget=False, backend=None):
         self.code = code
         self.quota = quota
         self.budget = budget
+        self.backend = backend
 
 
 # API-limit signatures in a dying session's error output (case-insensitive).
@@ -956,47 +959,76 @@ def rotate_logs():
 
 
 def run_session(role, prompt):
-    """Launch one vibe session; returns a SessionResult, None if vibe is
-    missing. Raises Shutdown if SIGTERM arrived (before or during the
-    session).
+    """Launch one agent session; returns a SessionResult, None if no
+    backend CLI is installed. Raises Shutdown if SIGTERM arrived (before
+    or during the session).
 
     The shared daily budget is checked and counted here — the one
     choke point every role and repo goes through, atomically under the
     shared counter's lock. A reserved slot whose launch never started
-    (vibe missing) is given back: a launch that never runs must not
+    (CLI missing) is given back: a launch that never runs must not
     burn the shared daily budget. Reviews and verifications run with a
     lower turn cap than implementation sessions (their conversations
     rarely need the full tail).
+
+    The backend (vibe or Claude) comes from backend.resolve(role). In
+    AGENT_BACKEND=both mode a session that dies on an API limit, or
+    whose CLI is missing, is retried once on the other backend in the
+    same budget slot; the repo pauses for quota only when both died.
     """
-    global _session_proc
     if _shutdown["requested"]:
         raise Shutdown()
     if not budget_reserve():
         log(f"daily session budget spent; not launching {role} session")
         return SessionResult(None, budget=True)
     LOGDIR.mkdir(exist_ok=True)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    logfile = LOGDIR / f"{ts}-{role}.json"
-    log(f"starting {role} session (log: {logfile.name})")
     max_turns = MAX_TURNS if role in ("impl", "arch") else MAX_TURNS_REVIEW
     # The discipline preamble rides along on every launch: the binding
     # point that reaches the model without depending on it reading
     # AGENTS.md or the standards doc first.
     import memory  # local import: dispatcher dir is on sys.path; best-effort
     scope = "ops." + REPO_NAME
-    cmd = ["vibe", "-p", prompt + SPENDING_DISCIPLINE + memory.block(scope),
-           "--auto-approve", "--trust",
-           "--max-turns", max_turns, "--max-price", MAX_PRICE,
-           "--output", "json"]
+    full_prompt = prompt + SPENDING_DISCIPLINE + memory.block(scope)
+    died = None   # last session that died on an API limit
+    for attempt, name in enumerate(backend.resolve(role)):
+        if _shutdown["requested"]:
+            raise Shutdown()
+        if attempt:
+            log(f"falling back: retrying {role} session on {name}")
+        res = _launch(name, role, full_prompt, max_turns, scope)
+        if res is None:
+            continue
+        if not res.quota:
+            return res
+        died = res
+    if died is None:
+        budget_release()
+    return died
+
+
+def _launch(name, role, prompt, max_turns, scope):
+    """Run one session on one backend; None if its CLI is missing.
+
+    Log names: <ts>-<role>.* for vibe (unchanged), <ts>-claude-<role>.*
+    for Claude — both still match the *-<role>.exit glob
+    report_session_failure() uses.
+    """
+    global _session_proc
+    import memory
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    stem = f"{ts}-{role}" if name == "vibe" else f"{ts}-{name}-{role}"
+    logfile = LOGDIR / f"{stem}.json"
+    log(f"starting {role} session on {name} (log: {logfile.name})")
+    cmd = backend.build_cmd(name, prompt, max_turns, MAX_PRICE)
     try:
         proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True)
+                               stderr=subprocess.PIPE, text=True,
+                               env=backend.session_env(name))
     except OSError as e:
         # missing, not executable (broken update, noexec mount), ... —
-        # the launch never happened, so give the reserved unit back or
-        # every occurrence permanently shrinks the shared daily budget.
-        log(f"ABORT: could not launch vibe CLI: {e}")
-        budget_release()
+        # the launch never happened: the caller tries the fallback
+        # backend or gives the reserved budget slot back.
+        log(f"ABORT: could not launch {name} CLI: {e}")
         return None
     _session_proc = proc
     try:
@@ -1005,26 +1037,32 @@ def run_session(role, prompt):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
-        (LOGDIR / f"{ts}-{role}.exit").write_text("timeout\n")
+        (LOGDIR / f"{stem}.exit").write_text("timeout\n")
         log(f"{role} session timed out after {SESSION_TIMEOUT_S}s")
-        return SessionResult(124)
+        return SessionResult(124, backend=name)
     finally:
         _session_proc = None
     logfile.write_text(stdout or "")
     if code != 0 and (stderr or "").strip():
-        (LOGDIR / f"{ts}-{role}.err").write_text(stderr)
-    (LOGDIR / f"{ts}-{role}.exit").write_text(str(code) + "\n")
-    # Quota classification reads the CLI's own error output (stderr) only:
-    # the transcript (stdout) routinely discusses quotas/rate limits and
-    # must not mask a real crash as an API-limit death.
+        (LOGDIR / f"{stem}.err").write_text(stderr)
+    (LOGDIR / f"{stem}.exit").write_text(str(code) + "\n")
+    # stderr only — the stdout transcript's tool output (AGENTS.md
+    # text, repo data, line numbers) falsely matches the signature.
+    # Claude's stdout is a single result object, not a transcript: its
+    # structured error fields classify too.
     quota = is_quota_failure(code, stderr or "")
-    log(f"{role} session finished, exit {code}"
+    cost = ""
+    if name == "claude":
+        quota = quota or backend.claude_quota(code, stdout, QUOTA_SIG)
+        usd = backend.claude_cost(stdout)
+        cost = f", ${usd:.2f}" if usd is not None else ""
+    log(f"{role} session on {name} finished, exit {code}{cost}"
         + (" (API quota/limit signature)" if quota else ""))
-    memory.save(scope, "session", f"{role} exit {code}"
+    memory.save(scope, "session", f"{role} on {name} exit {code}"
                 + (" (quota)" if quota else ""))
     if _shutdown["requested"]:
         raise Shutdown()
-    return SessionResult(code, quota=quota)
+    return SessionResult(code, quota=quota, backend=name)
 
 
 def request_publish():
