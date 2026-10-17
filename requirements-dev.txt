@@ -1,2 +1,4 @@
-pytest>=7.0
+# Dev tools, pinned. Keep in sync with [project.optional-dependencies].dev
+# in pyproject.toml. Runtime dependencies: none (stdlib only).
+pytest==8.4.2
 ruff==0.17.0
