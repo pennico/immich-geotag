@@ -18,7 +18,7 @@ Configuration (environment or .env next to geotag.py):
                      (optional, defaults to IMMICH_URL)
 
 Usage:
-  python3 gemini_candidates.py --after 2026-03-01 --before 2026-05-01
+  python3 gemini_candidates.py --after 2024-06-01 --before 2024-08-01
   python3 gemini_candidates.py --asset 73a6b604-... --out geotag-data/gemini_candidates.csv
 """
 
@@ -59,8 +59,8 @@ PROMPT_TEMPLATE = (
     "- Only name a place you are confident about; never guess from generic scenery.\n"
     "- Do not name people, objects, food, or interiors as places.\n"
     "- Return ONLY a JSON array with exactly {n} objects, one per photograph:\n"
-    '  [{{"index": 1, "place": "Chichen Itza", "city": "Tinum", '
-    '"country": "Mexico", "confidence": 0.9}}, ...]\n'
+    '  [{{"index": 1, "place": "Eiffel Tower", "city": "Paris", '
+    '"country": "France", "confidence": 0.9}}, ...]\n'
     '- If a photograph has no identifiable place, use '
     '{{"index": i, "place": null, "confidence": 0}}.'
 )
@@ -146,7 +146,7 @@ def parse_gemini_json(text, n):
 def _to_datetime(value):
     """Normalize a date or datetime string to Immich's expected format.
 
-    Immich's search validation rejects bare dates ("2026-03-01"); it wants
+    Immich's search validation rejects bare dates ("2024-06-01"); it wants
     a full datetime. Dates are interpreted as UTC midnight.
     """
     if value and "T" not in value:
@@ -198,11 +198,12 @@ def in_bbox(lat, lon, bbox):
 
 
 def geo_allowed(lat, lon, place, geocoded_name, allow_bboxes=(), airport_bboxes=()):
-    """Owner's trip-geography rule.
+    """Trip-geography rule.
 
     A location is allowed inside one of the --allow-bbox regions (e.g.
-    Mexico), or - when the identified place is an airport - inside one of
-    the --airport-bbox regions (e.g. US / London, for travel days).
+    the country you travelled in), or - when the identified place is an
+    airport - inside one of the --airport-bbox regions (e.g. the countries
+    you flew through, for travel days).
     Anything else is a misidentification or a bad geocode and must be
     disregarded.
     """
@@ -219,7 +220,7 @@ def geocode_place(place, city, country, email, validate=None):
     Nominatim treats commas as address components, so a full
     "landmark, city, country" query often fails while parts of it resolve.
     Try progressively simpler forms; first hit wins. When the place name
-    itself is comma-separated ("El Castillo, Chichen Itza"), try its
+    itself is comma-separated ("North Tower, Old Castle"), try its
     segments in reverse order - the trailing parent site is usually the
     landmark Nominatim knows.
 
@@ -279,7 +280,7 @@ def main():
     parser.add_argument("--airport-bbox", action="append", default=[],
                         metavar="LAT_MIN,LON_MIN,LAT_MAX,LON_MAX",
                         help="extra allowed region for airport-named places, "
-                             "e.g. US/UK for travel days (repeatable)")
+                             "e.g. transit countries on travel days (repeatable)")
     args = parser.parse_args()
 
     allow_bboxes = [b for b in (parse_bbox(x) for x in args.allow_bbox) if b]

@@ -1354,12 +1354,12 @@ class TestParseGeminiJson(unittest.TestCase):
 
     def test_valid_full_answer(self):
         text = json.dumps([
-            {"index": 1, "place": "Chichen Itza", "city": "Tinum",
-             "country": "Mexico", "confidence": 0.9},
+            {"index": 1, "place": "Fort Alpha", "city": "Alphaville",
+             "country": "Testland", "confidence": 0.9},
             {"index": 2, "place": None, "confidence": 0},
         ])
         results = gemini_candidates.parse_gemini_json(text, 2)
-        self.assertEqual(results[0]["place"], "Chichen Itza")
+        self.assertEqual(results[0]["place"], "Fort Alpha")
         self.assertEqual(results[0]["confidence"], 0.9)
         self.assertIsNone(results[1]["place"])
 
@@ -1402,25 +1402,25 @@ class TestGeocodePlace(unittest.TestCase):
     def test_full_query_hits_first(self):
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
             mock_geo.return_value = (1.0, 2.0, "Somewhere")
-            out = gemini_candidates.geocode_place("Chichen Itza", "Tinum", "Mexico", None)
+            out = gemini_candidates.geocode_place("Fort Alpha", "Alphaville", "Testland", None)
         self.assertEqual(out, (1.0, 2.0, "Somewhere"))
         self.assertEqual(mock_geo.call_count, 1)
-        mock_geo.assert_called_with("Chichen Itza, Tinum, Mexico", None)
+        mock_geo.assert_called_with("Fort Alpha, Alphaville, Testland", None)
 
     def test_falls_back_through_comma_segments(self):
         # Full queries and the comma-containing place fail; the trailing
         # parent site segment resolves. Query order: (place,city,country),
         # (place,city), (place,country), place, then reversed place
-        # segments - "Chichen Itza" is the 5th.
+        # segments - "Fort Alpha" is the 5th.
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
             mock_geo.side_effect = [None, None, None, None,
-                                    (20.68, -88.56, "Chichen Itza")]
+                                    (-27.00, -16.99, "Fort Alpha")]
             with mock.patch.object(gemini_candidates.time, "sleep"):
                 out = gemini_candidates.geocode_place(
-                    "El Castillo, Chichen Itza", "Tinum", "Mexico", None)
-        self.assertEqual(out, (20.68, -88.56, "Chichen Itza"))
+                    "North Tower, Fort Alpha", "Alphaville", "Testland", None)
+        self.assertEqual(out, (-27.00, -16.99, "Fort Alpha"))
         self.assertEqual(mock_geo.call_count, 5)
-        self.assertEqual(mock_geo.call_args_list[4][0][0], "Chichen Itza")
+        self.assertEqual(mock_geo.call_args_list[4][0][0], "Fort Alpha")
 
     def test_all_fail_returns_none(self):
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
@@ -1430,41 +1430,42 @@ class TestGeocodePlace(unittest.TestCase):
                     gemini_candidates.geocode_place("Nowhere", "X", "Y", None))
 
     def test_validator_rejects_wrong_continent_and_tries_next(self):
-        # First hit resolves to Dominican Republic; the validator (Mexico
-        # trip bbox) rejects it and the next query variant finds Mexico.
+        # First hit resolves to a same-named place on another continent; the
+        # validator (trip bbox) rejects it and the next query variant finds
+        # the one inside the trip region.
         # Latitude alone cannot tell them apart - the longitude can.
-        mexico = lambda lat, lon, name: (  # noqa: E731
-            14.5 < lat < 33.0 and -118.0 < lon < -86.0)
-        calls = [(18.48, -69.93, "Santo Domingo, Dominican Republic"),
-                 (17.06, -96.72, "Oaxaca, Mexico")]
+        trip_region = lambda lat, lon, name: (  # noqa: E731
+            -30.0 < lat < -24.0 and -20.0 < lon < -14.0)
+        calls = [(-26.50, 30.00, "St. Mary's Church, Farland"),
+                 (-26.20, -16.40, "Gammaton, Testland")]
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
             mock_geo.side_effect = calls
             with mock.patch.object(gemini_candidates.time, "sleep"):
                 out = gemini_candidates.geocode_place(
-                    "Church of Santo Domingo de Guzman", "Oaxaca", "Mexico",
-                    None, validate=mexico)
-        self.assertEqual(out, (17.06, -96.72, "Oaxaca, Mexico"))
+                    "St. Mary's Church", "Gammaton", "Testland",
+                    None, validate=trip_region)
+        self.assertEqual(out, (-26.20, -16.40, "Gammaton, Testland"))
         self.assertEqual(mock_geo.call_count, 2)
 
     def test_validator_accepts_first_hit(self):
-        mexico = lambda lat, lon, name: (  # noqa: E731
-            14.5 < lat < 33.0 and -118.0 < lon < -86.0)
+        trip_region = lambda lat, lon, name: (  # noqa: E731
+            -30.0 < lat < -24.0 and -20.0 < lon < -14.0)
         with mock.patch.object(gemini_candidates, "nominatim_search") as mock_geo:
-            mock_geo.return_value = (20.68, -88.57, "Chichen Itza, Mexico")
+            mock_geo.return_value = (-27.00, -17.00, "Fort Alpha, Testland")
             out = gemini_candidates.geocode_place(
-                "Chichen Itza", "Tinum", "Mexico", None, validate=mexico)
-        self.assertEqual(out, (20.68, -88.57, "Chichen Itza, Mexico"))
+                "Fort Alpha", "Alphaville", "Testland", None, validate=trip_region)
+        self.assertEqual(out, (-27.00, -17.00, "Fort Alpha, Testland"))
         self.assertEqual(mock_geo.call_count, 1)
 
 
 class TestToDatetime(unittest.TestCase):
     def test_bare_date_gets_time(self):
-        self.assertEqual(gemini_candidates._to_datetime("2026-03-01"),
-                         "2026-03-01T00:00:00.000Z")
+        self.assertEqual(gemini_candidates._to_datetime("2001-05-01"),
+                         "2001-05-01T00:00:00.000Z")
 
     def test_datetime_unchanged(self):
-        self.assertEqual(gemini_candidates._to_datetime("2026-03-01T10:00:00.000Z"),
-                         "2026-03-01T10:00:00.000Z")
+        self.assertEqual(gemini_candidates._to_datetime("2001-05-01T10:00:00.000Z"),
+                         "2001-05-01T10:00:00.000Z")
 
     def test_none_unchanged(self):
         self.assertIsNone(gemini_candidates._to_datetime(None))
@@ -1478,7 +1479,7 @@ class TestWindowAssets(unittest.TestCase):
         with mock.patch.object(gemini_candidates, "http_json") as mock_http:
             mock_http.side_effect = pages
             return list(gemini_candidates.window_assets(
-                immich, "2026-03-01", "2026-05-01", not_found_ids))
+                immich, "2001-05-01", "2001-07-01", not_found_ids))
 
     def test_filters(self):
         page = {"assets": {"items": [
@@ -1504,19 +1505,19 @@ class TestWindowAssets(unittest.TestCase):
 
 class TestHaversineAndTime(unittest.TestCase):
     def test_haversine_known_distance(self):
-        # Chichen Itza -> Cancun is roughly 185 km
-        d = gemini_apply.haversine_km(20.68, -88.57, 21.16, -86.85)
+        # Fort Alpha -> Port Beta is roughly 180 km
+        d = gemini_apply.haversine_km(-27.00, -17.00, -26.00, -15.60)
         self.assertTrue(150 < d < 220, d)
 
     def test_haversine_zero(self):
         self.assertAlmostEqual(gemini_apply.haversine_km(10.0, 20.0, 10.0, 20.0), 0.0)
 
     def test_parse_time_z_suffix(self):
-        t = gemini_apply.parse_time("2026-04-08T15:17:43.403Z")
+        t = gemini_apply.parse_time("2001-06-08T15:17:43.403Z")
         self.assertIsNotNone(t)
 
     def test_parse_time_offset(self):
-        t = gemini_apply.parse_time("2026-04-08T15:17:43+00:00")
+        t = gemini_apply.parse_time("2001-06-08T15:17:43+00:00")
         self.assertIsNotNone(t)
 
     def test_parse_time_garbage(self):
@@ -1526,8 +1527,8 @@ class TestHaversineAndTime(unittest.TestCase):
 
 class TestParseBbox(unittest.TestCase):
     def test_valid(self):
-        self.assertEqual(gemini_candidates.parse_bbox("14.5,-118.0,33.0,-86.0"),
-                         (14.5, -118.0, 33.0, -86.0))
+        self.assertEqual(gemini_candidates.parse_bbox("-30.0,-20.0,-24.0,-14.0"),
+                         (-30.0, -20.0, -24.0, -14.0))
 
     def test_wrong_arity(self):
         self.assertIsNone(gemini_candidates.parse_bbox("1,2,3"))
@@ -1536,43 +1537,43 @@ class TestParseBbox(unittest.TestCase):
         self.assertIsNone(gemini_candidates.parse_bbox("a,b,c,d"))
 
     def test_in_bbox(self):
-        bbox = (14.5, -118.0, 33.0, -86.0)
-        self.assertTrue(gemini_candidates.in_bbox(20.68, -88.57, bbox))
+        bbox = (-30.0, -20.0, -24.0, -14.0)
+        self.assertTrue(gemini_candidates.in_bbox(-27.00, -17.00, bbox))
         self.assertFalse(gemini_candidates.in_bbox(48.85, 2.29, bbox))
 
 
 class TestGeoAllowed(unittest.TestCase):
-    """Owner's trip-geography rule: Mexico + airports in US/London."""
+    """Trip-geography rule: one allowed region + airports in a second region."""
 
-    MEXICO = (14.5, -118.0, 33.0, -86.0)
-    US = (24.0, -125.0, 50.0, -66.0)
+    TRIP = (-30.0, -20.0, -24.0, -14.0)
+    AIRPORTS = (-40.0, -10.0, -34.0, -4.0)
 
     def test_inside_allow_bbox(self):
         self.assertTrue(gemini_candidates.geo_allowed(
-            20.68, -88.57, "Chichen Itza", "Chichen Itza, Yucatan, Mexico",
-            [self.MEXICO]))
+            -27.00, -17.00, "Fort Alpha", "Fort Alpha, Alphaville, Testland",
+            [self.TRIP]))
 
     def test_outside_all_disallowed(self):
-        # Santo Domingo, Dominican Republic - the exact failure we hit
+        # same-named church on another continent - the failure this guards
         self.assertFalse(gemini_candidates.geo_allowed(
-            18.48, -69.93, "Church of Santo Domingo de Guzman",
-            "Santo Domingo, Dominican Republic", [self.MEXICO]))
+            -26.50, 30.00, "St. Mary's Church",
+            "St. Mary's Church, Farland", [self.TRIP]))
 
     def test_airport_inside_airport_bbox(self):
         self.assertTrue(gemini_candidates.geo_allowed(
-            33.94, -118.40, "LAX Airport", "Los Angeles International Airport",
-            [self.MEXICO], [self.US]))
+            -37.00, -7.00, "Delta Airport", "Delta International Airport",
+            [self.TRIP], [self.AIRPORTS]))
 
     def test_non_airport_outside_allow_bbox_rejected(self):
         # "airport" not in the name -> airport bboxes do not apply
         self.assertFalse(gemini_candidates.geo_allowed(
-            33.94, -118.40, "Some Diner", "Diner, Los Angeles",
-            [self.MEXICO], [self.US]))
+            -37.00, -7.00, "Some Diner", "Diner, Delta City",
+            [self.TRIP], [self.AIRPORTS]))
 
     def test_airport_outside_airport_bbox_rejected(self):
         self.assertFalse(gemini_candidates.geo_allowed(
-            -33.94, 18.40, "Cape Town Airport", "Cape Town International Airport",
-            [self.MEXICO], [self.US]))
+            10.00, 60.00, "Epsilon Airport", "Epsilon International Airport",
+            [self.TRIP], [self.AIRPORTS]))
 
 
 class TestRecoverAndConfirm(unittest.TestCase):
@@ -1590,7 +1591,7 @@ class TestRecoverAndConfirm(unittest.TestCase):
 
     def _run(self, rows, **kw):
         with mock.patch.object(gemini_apply, "geocode_place") as mock_geo:
-            mock_geo.return_value = kw.pop("geo", (20.68, -88.57, "Chichen Itza"))
+            mock_geo.return_value = kw.pop("geo", (-27.01, -17.01, "Fort Alpha"))
             out = gemini_apply.recover_and_confirm(
                 rows, None, kw.pop("min_confidence", 0.5), kw.pop("floor", 0.3),
                 kw.pop("hours", 2), kw.pop("km", 10), None)
@@ -1598,38 +1599,38 @@ class TestRecoverAndConfirm(unittest.TestCase):
 
     def test_high_confidence_recovered_without_coherence(self):
         # No anchors at all - high confidence still recovers
-        rows = [self._row("a1", "no_match", "2026-04-08T10:00:00Z",
-                          place="Great Ball Court", confidence="0.95")]
+        rows = [self._row("a1", "no_match", "2001-06-08T10:00:00Z",
+                          place="Old Courtyard", confidence="0.95")]
         rows, recovered, confirmed = self._run(rows)
         self.assertEqual((recovered, confirmed), (1, 0))
         self.assertEqual(rows[0]["status"], "candidate")
-        self.assertEqual(rows[0]["latitude"], "20.68")
+        self.assertEqual(rows[0]["latitude"], "-27.01")
         self.assertEqual(rows[0]["inferred_from"], "")
 
     def test_uncertain_confirmed_by_coherent_neighbors(self):
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T10:45:00Z",
-                      place="Great Ball Court", confidence="0.4"),
-            self._row("a3", "candidate", "2026-04-08T11:30:00Z",
-                      "20.682", "-88.569", "Chichen Itza"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z",
+                      "-27.00", "-17.00", "Fort Alpha"),
+            self._row("a2", "no_match", "2001-06-08T10:45:00Z",
+                      place="Old Courtyard", confidence="0.4"),
+            self._row("a3", "candidate", "2001-06-08T11:30:00Z",
+                      "-26.998", "-16.999", "Fort Alpha"),
         ]
         rows, recovered, confirmed = self._run(rows)
         self.assertEqual((recovered, confirmed), (0, 1))
         self.assertEqual(rows[1]["status"], "confirmed")
         # the proposal's own geocode, not the neighbor's coords
-        self.assertEqual(rows[1]["latitude"], "20.68")
+        self.assertEqual(rows[1]["latitude"], "-27.01")
 
     def test_uncertain_scattered_neighbors_not_confirmed(self):
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T10:45:00Z",
-                      place="Great Ball Court", confidence="0.4"),
-            # second anchor 300 km away within the window -> not coherent
-            self._row("a3", "candidate", "2026-04-08T11:30:00Z",
-                      "21.16", "-86.85", "Cancun"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z",
+                      "-27.00", "-17.00", "Fort Alpha"),
+            self._row("a2", "no_match", "2001-06-08T10:45:00Z",
+                      place="Old Courtyard", confidence="0.4"),
+            # second anchor ~180 km away within the window -> not coherent
+            self._row("a3", "candidate", "2001-06-08T11:30:00Z",
+                      "-26.00", "-15.60", "Port Beta"),
         ]
         rows, recovered, confirmed = self._run(rows)
         self.assertEqual((recovered, confirmed), (0, 0))
@@ -1637,39 +1638,39 @@ class TestRecoverAndConfirm(unittest.TestCase):
 
     def test_uncertain_no_neighbors_not_confirmed(self):
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T18:00:00Z",
-                      place="Great Ball Court", confidence="0.4"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z",
+                      "-27.00", "-17.00", "Fort Alpha"),
+            self._row("a2", "no_match", "2001-06-08T18:00:00Z",
+                      place="Old Courtyard", confidence="0.4"),
         ]
         rows, recovered, confirmed = self._run(rows)
         self.assertEqual((recovered, confirmed), (0, 0))
 
     def test_below_floor_left_blank(self):
-        rows = [self._row("a1", "no_match", "2026-04-08T10:00:00Z",
+        rows = [self._row("a1", "no_match", "2001-06-08T10:00:00Z",
                           place="Maybe a beach", confidence="0.2")]
         rows, recovered, confirmed = self._run(rows)
         self.assertEqual((recovered, confirmed), (0, 0))
         self.assertEqual(rows[0]["status"], "no_match")
 
     def test_geocode_still_fails_stays_no_match(self):
-        rows = [self._row("a1", "no_match", "2026-04-08T10:00:00Z",
+        rows = [self._row("a1", "no_match", "2001-06-08T10:00:00Z",
                           place="Ungeocodable", confidence="0.9")]
         rows, recovered, confirmed = self._run(rows, geo=None)
         self.assertEqual((recovered, confirmed), (0, 0))
         self.assertEqual(rows[0]["status"], "no_match")
 
     def test_no_proposal_untouched(self):
-        rows = [self._row("a1", "no_match", "2026-04-08T10:00:00Z")]
+        rows = [self._row("a1", "no_match", "2001-06-08T10:00:00Z")]
         rows, recovered, confirmed = self._run(rows)
         self.assertEqual((recovered, confirmed), (0, 0))
 
     def test_applied_rows_anchor(self):
         rows = [
-            self._row("a1", "applied", "2026-04-08T10:00:00Z",
-                      "20.68", "-88.57", "Chichen Itza"),
-            self._row("a2", "no_match", "2026-04-08T10:30:00Z",
-                      place="Great Ball Court", confidence="0.4"),
+            self._row("a1", "applied", "2001-06-08T10:00:00Z",
+                      "-27.00", "-17.00", "Fort Alpha"),
+            self._row("a2", "no_match", "2001-06-08T10:30:00Z",
+                      place="Old Courtyard", confidence="0.4"),
         ]
         rows, recovered, confirmed = self._run(rows)
         self.assertEqual((recovered, confirmed), (0, 1))
@@ -1678,7 +1679,7 @@ class TestRecoverAndConfirm(unittest.TestCase):
 class TestFlagOutliers(unittest.TestCase):
     """Small isolated place-groups are flagged for review, not applied."""
 
-    def _row(self, aid, status, taken_at, lat="20.68", lon="-88.57", place="X"):
+    def _row(self, aid, status, taken_at, lat="-27.00", lon="-17.00", place="X"):
         return {"asset_id": aid, "status": status, "taken_at": taken_at,
                 "latitude": lat, "longitude": lon, "place": place,
                 "geocoded_name": "", "maps_url": "", "confidence": "",
@@ -1686,11 +1687,11 @@ class TestFlagOutliers(unittest.TestCase):
 
     def test_small_isolated_group_flagged(self):
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z", place="Wembley"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z", place="Stadium Zeta"),
             # nearest other located photo is days away
-            self._row("a2", "candidate", "2026-04-20T10:00:00Z", place="Chichen"),
-            self._row("a3", "candidate", "2026-04-20T11:00:00Z", place="Chichen"),
-            self._row("a4", "candidate", "2026-04-20T12:00:00Z", place="Chichen"),
+            self._row("a2", "candidate", "2001-06-20T10:00:00Z", place="Fort"),
+            self._row("a3", "candidate", "2001-06-20T11:00:00Z", place="Fort"),
+            self._row("a4", "candidate", "2001-06-20T12:00:00Z", place="Fort"),
         ]
         rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
         self.assertEqual(flagged, 1)
@@ -1699,10 +1700,10 @@ class TestFlagOutliers(unittest.TestCase):
 
     def test_small_group_with_nearby_photos_not_flagged(self):
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z", place="Wembley"),
-            self._row("a2", "candidate", "2026-04-08T12:00:00Z", place="Chichen"),
-            self._row("a3", "candidate", "2026-04-08T14:00:00Z", place="Chichen"),
-            self._row("a4", "candidate", "2026-04-08T16:00:00Z", place="Chichen"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z", place="Stadium Zeta"),
+            self._row("a2", "candidate", "2001-06-08T12:00:00Z", place="Fort"),
+            self._row("a3", "candidate", "2001-06-08T14:00:00Z", place="Fort"),
+            self._row("a4", "candidate", "2001-06-08T16:00:00Z", place="Fort"),
         ]
         rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
         self.assertEqual(flagged, 0)
@@ -1710,17 +1711,17 @@ class TestFlagOutliers(unittest.TestCase):
 
     def test_big_group_not_flagged(self):
         rows = [self._row(f"a{i}", "candidate",
-                          f"2026-04-08T10:0{i}:00Z", place="Chichen")
+                          f"2001-06-08T10:0{i}:00Z", place="Fort")
                 for i in range(1, 4)]
         rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
         self.assertEqual(flagged, 0)
 
     def test_applied_keeps_status_but_flagged(self):
         rows = [
-            self._row("a1", "applied", "2026-04-08T10:00:00Z", place="Wembley"),
-            self._row("a2", "candidate", "2026-04-20T10:00:00Z", place="Chichen"),
-            self._row("a3", "candidate", "2026-04-20T11:00:00Z", place="Chichen"),
-            self._row("a4", "candidate", "2026-04-20T12:00:00Z", place="Chichen"),
+            self._row("a1", "applied", "2001-06-08T10:00:00Z", place="Stadium Zeta"),
+            self._row("a2", "candidate", "2001-06-20T10:00:00Z", place="Fort"),
+            self._row("a3", "candidate", "2001-06-20T11:00:00Z", place="Fort"),
+            self._row("a4", "candidate", "2001-06-20T12:00:00Z", place="Fort"),
         ]
         rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
         self.assertEqual(flagged, 1)
@@ -1733,10 +1734,10 @@ class TestFlagOutliers(unittest.TestCase):
 
     def test_reviewed_rows_never_reflagged(self):
         rows = [
-            self._row("a1", "applied", "2026-04-08T10:00:00Z", place="Wembley"),
-            self._row("a2", "candidate", "2026-04-20T10:00:00Z", place="Chichen"),
-            self._row("a3", "candidate", "2026-04-20T11:00:00Z", place="Chichen"),
-            self._row("a4", "candidate", "2026-04-20T12:00:00Z", place="Chichen"),
+            self._row("a1", "applied", "2001-06-08T10:00:00Z", place="Stadium Zeta"),
+            self._row("a2", "candidate", "2001-06-20T10:00:00Z", place="Fort"),
+            self._row("a3", "candidate", "2001-06-20T11:00:00Z", place="Fort"),
+            self._row("a4", "candidate", "2001-06-20T12:00:00Z", place="Fort"),
         ]
         rows[0]["flag"] = "reviewed"  # owner approved it on the review page
         rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
@@ -1746,8 +1747,8 @@ class TestFlagOutliers(unittest.TestCase):
     def test_reviewed_rows_still_anchor_isolation(self):
         # A reviewed photo nearby must still prevent a false outlier flag.
         rows = [
-            self._row("a1", "applied", "2026-04-08T10:00:00Z", place="Mexico City"),
-            self._row("a2", "candidate", "2026-04-08T11:00:00Z", place="Wembley"),
+            self._row("a1", "applied", "2001-06-08T10:00:00Z", place="Capital City"),
+            self._row("a2", "candidate", "2001-06-08T11:00:00Z", place="Stadium Zeta"),
         ]
         rows[0]["flag"] = "reviewed"
         rows, flagged = gemini_apply.flag_outliers(rows, max_group=2, isolation_hours=12)
@@ -1762,8 +1763,8 @@ class TestMergeIntoState(unittest.TestCase):
 
     def test_merge_candidate_marks_located_gemini(self):
         cand = [{"asset_id": "a1", "status": "candidate",
-                 "latitude": "20.68", "longitude": "-88.57",
-                 "place": "Chichen Itza", "confidence": "0.99"}]
+                 "latitude": "-27.00", "longitude": "-17.00",
+                 "place": "Fort Alpha", "confidence": "0.99"}]
         state, merged = gemini_apply.merge_into_state(self._state(), cand)
         self.assertEqual(merged, 1)
         self.assertEqual(state[0]["status"], "located")
@@ -1771,8 +1772,8 @@ class TestMergeIntoState(unittest.TestCase):
 
     def test_merge_confirmed_marks_located_gemini_confirmed(self):
         cand = [{"asset_id": "a1", "status": "confirmed",
-                 "latitude": "20.68", "longitude": "-88.57",
-                 "place": "Great Ball Court", "confidence": "0.4"}]
+                 "latitude": "-27.00", "longitude": "-17.00",
+                 "place": "Old Courtyard", "confidence": "0.4"}]
         state, merged = gemini_apply.merge_into_state(self._state(), cand)
         self.assertEqual(merged, 1)
         self.assertEqual(state[0]["source"], "gemini-confirmed")
@@ -1782,8 +1783,8 @@ class TestMergeIntoState(unittest.TestCase):
                   "longitude": "2.0", "place": "Old", "source": "vision",
                   "score": "0.9", "status": "applied", "maps_url": ""}]
         cand = [{"asset_id": "a1", "status": "candidate",
-                 "latitude": "20.68", "longitude": "-88.57",
-                 "place": "Chichen Itza", "confidence": "0.99"}]
+                 "latitude": "-27.00", "longitude": "-17.00",
+                 "place": "Fort Alpha", "confidence": "0.99"}]
         state, merged = gemini_apply.merge_into_state(state, cand)
         self.assertEqual(merged, 0)
         self.assertEqual(state[0]["place"], "Old")
@@ -1791,7 +1792,7 @@ class TestMergeIntoState(unittest.TestCase):
     def test_merge_skips_no_match_and_flagged(self):
         for status in ("no_match", "flagged"):
             cand = [{"asset_id": "a1", "status": status,
-                     "latitude": "20.68", "longitude": "-88.57"}]
+                     "latitude": "-27.00", "longitude": "-17.00"}]
             state, merged = gemini_apply.merge_into_state(self._state(), cand)
             self.assertEqual(merged, 0)
             self.assertEqual(state[0]["status"], "not_found")
@@ -1808,15 +1809,15 @@ class TestFlagGeoOutliers(unittest.TestCase):
                 "inferred_from": "", "flag": flag}
 
     def test_wrong_continent_candidate_flagged(self):
-        # "Golden Triangle Park" geocoded to Ottawa; same-day photos are
-        # all at the real Golden Triangle in Thailand.
+        # "Harbor Lighthouse Park" geocoded to a same-named place on another
+        # continent; same-day photos are all at the real Harbor Lighthouse.
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "45.419", "-75.685", "Golden Triangle Park"),
-            self._row("a2", "candidate", "2026-04-08T10:30:00Z",
-                      "20.353", "100.081", "Golden Triangle Viewpoint"),
-            self._row("a3", "candidate", "2026-04-08T11:00:00Z",
-                      "20.353", "100.081", "Golden Triangle Viewpoint"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z",
+                      "5.000", "70.000", "Harbor Lighthouse Park"),
+            self._row("a2", "candidate", "2001-06-08T10:30:00Z",
+                      "-27.000", "-17.000", "Harbor Lighthouse Viewpoint"),
+            self._row("a3", "candidate", "2001-06-08T11:00:00Z",
+                      "-27.000", "-17.000", "Harbor Lighthouse Viewpoint"),
         ]
         rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
         self.assertEqual(flagged, 1)
@@ -1826,10 +1827,10 @@ class TestFlagGeoOutliers(unittest.TestCase):
 
     def test_coherent_candidate_not_flagged(self):
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "20.353", "100.081", "Golden Triangle Park"),
-            self._row("a2", "candidate", "2026-04-08T10:30:00Z",
-                      "20.340", "100.105", "Golden Triangle Viewpoint"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z",
+                      "-27.000", "-17.000", "Harbor Lighthouse Park"),
+            self._row("a2", "candidate", "2001-06-08T10:30:00Z",
+                      "-27.012", "-16.976", "Harbor Lighthouse Viewpoint"),
         ]
         rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
         self.assertEqual(flagged, 0)
@@ -1837,20 +1838,20 @@ class TestFlagGeoOutliers(unittest.TestCase):
     def test_no_neighbors_left_alone(self):
         # Lonely photos are the isolation flagger's job, not this one's.
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "45.419", "-75.685"),
-            self._row("a2", "candidate", "2026-04-20T10:00:00Z",
-                      "20.353", "100.081"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z",
+                      "5.000", "70.000"),
+            self._row("a2", "candidate", "2001-06-20T10:00:00Z",
+                      "-27.000", "-17.000"),
         ]
         rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
         self.assertEqual(flagged, 0)
 
     def test_reviewed_rows_exempt(self):
         rows = [
-            self._row("a1", "candidate", "2026-04-08T10:00:00Z",
-                      "45.419", "-75.685", flag="reviewed"),
-            self._row("a2", "candidate", "2026-04-08T10:30:00Z",
-                      "20.353", "100.081"),
+            self._row("a1", "candidate", "2001-06-08T10:00:00Z",
+                      "5.000", "70.000", flag="reviewed"),
+            self._row("a2", "candidate", "2001-06-08T10:30:00Z",
+                      "-27.000", "-17.000"),
         ]
         rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
         # a1 is exempt; a2 contradicts its only neighbor and is flagged
@@ -1860,10 +1861,10 @@ class TestFlagGeoOutliers(unittest.TestCase):
 
     def test_applied_keeps_status_but_flagged(self):
         rows = [
-            self._row("a1", "applied", "2026-04-08T10:00:00Z",
-                      "45.419", "-75.685"),
-            self._row("a2", "candidate", "2026-04-08T10:30:00Z",
-                      "20.353", "100.081"),
+            self._row("a1", "applied", "2001-06-08T10:00:00Z",
+                      "5.000", "70.000"),
+            self._row("a2", "candidate", "2001-06-08T10:30:00Z",
+                      "-27.000", "-17.000"),
         ]
         rows, flagged = gemini_apply.flag_geo_outliers(rows, hours=12, km=100)
         # both contradict each other: applied keeps its status, candidate
