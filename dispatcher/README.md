@@ -178,6 +178,19 @@ budget hit (high), roadmap done (high), PR opened/approved/merged
 (default). Failures to send are logged, never fatal — GitHub issues are
 the durable record.
 
+Delivery rules:
+- `notify()` retries network errors, 5xx and 429 responses up to 3
+  times. A 4xx (auth or ACL) response fails at once.
+- A blocker goes into `seen_blockers` only after ntfy accepted its
+  announcement. A failed send is retried on the next tick.
+- An open, unanswered blocker is re-announced every 24 h
+  (`blocker_reminded` in state.json, `BLOCKER_REMIND_S`).
+- An issue that gets the `blocker` label again (failed task or run
+  job) is dropped from `seen_blockers` and `resumed_blockers`, so it is
+  announced again and a new `answered` resumes it.
+- `blocker_issues()` returns None when gh fails, and the tick aborts.
+  A gh failure is not read as "no blockers".
+
 ## Guardrails
 
 - `.vibe/hooks.toml` + `.vibe/guard.py` deny destructive bash commands

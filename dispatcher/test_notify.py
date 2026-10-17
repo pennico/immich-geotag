@@ -49,3 +49,63 @@ def test_notify_sends_unicode_title(monkeypatch):
 def test_notify_without_topic_is_silent_noop(monkeypatch):
     mod = _reload_with_topic(monkeypatch, topic="")
     assert mod.notify("t", "b") is False
+
+
+def _fake_urlopen_seq(outcomes, seen):
+    """urlopen stand-in: each call pops an outcome (an exception or a status)."""
+    class Resp:
+        def __init__(self, status):
+            self.status = status
+
+    @contextlib.contextmanager
+    def fake(req, timeout=None):
+        seen.append(req)
+        o = outcomes.pop(0)
+        if isinstance(o, Exception):
+            raise o
+        yield Resp(o)
+    return fake
+
+
+def _http_error(code):
+    import urllib.error
+    return urllib.error.HTTPError("u", code, "x", {}, None)
+
+
+def test_notify_retries_network_and_5xx_then_succeeds(monkeypatch):
+    mod = _reload_with_topic(monkeypatch)
+    monkeypatch.setattr(mod, "_sleep", lambda s: None)
+    seen = []
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_seq(
+        [OSError("connection refused"), _http_error(503), 200], seen))
+    assert mod.notify("t", "b") is True
+    assert len(seen) == 3
+
+
+def test_notify_gives_up_after_three_attempts(monkeypatch):
+    mod = _reload_with_topic(monkeypatch)
+    monkeypatch.setattr(mod, "_sleep", lambda s: None)
+    seen = []
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_seq(
+        [OSError("x")] * 5, seen))
+    assert mod.notify("t", "b") is False
+    assert len(seen) == 3
+
+
+def test_notify_does_not_retry_auth_errors(monkeypatch):
+    mod = _reload_with_topic(monkeypatch)
+    monkeypatch.setattr(mod, "_sleep", lambda s: None)
+    seen = []
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_seq(
+        [_http_error(403), 200], seen))
+    assert mod.notify("t", "b") is False
+    assert len(seen) == 1
+
+
+def test_notify_url_sets_click_and_action(monkeypatch):
+    mod = _reload_with_topic(monkeypatch)
+    seen = []
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_seq([200], seen))
+    assert mod.notify("t", "b", url="https://github.com/x/1") is True
+    assert seen[0].headers["Click"] == "https://github.com/x/1"
+    assert "https://github.com/x/1" in seen[0].headers["Actions"]

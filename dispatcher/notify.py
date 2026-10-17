@@ -4,16 +4,24 @@
 Set NTFY_TOPIC in the environment (optionally NTFY_SERVER to self-host,
 NTFY_TOKEN if the instance requires auth). Without a topic, notify() is a
 silent no-op. Failures are logged to stderr and never raised: notifications
-are best-effort, GitHub issues are the durable record.
+are best-effort, GitHub issues are the durable record. A send that fails on
+the network, a 5xx or a 429 is retried (RETRY_DELAYS_S); a 4xx is final
+(auth/ACL errors do not heal by retrying). Callers that must not lose a
+notification (blocker announcements) check the return value and retry on
+a later tick.
 """
 import os
 import sys
+import time
+import urllib.error
 import urllib.request
 
 SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 TOKEN = os.environ.get("NTFY_TOKEN", "")
 PRIORITIES = {"min": "1", "default": "3", "high": "4"}
+RETRY_DELAYS_S = (2, 5)   # pauses between the up-to-3 attempts
+_sleep = time.sleep       # patched in tests
 
 # HTTP headers are latin-1; titles and tags carry agent prose with
 # em-dashes and curly quotes that would crash the send (2026-10-07:
@@ -43,12 +51,23 @@ def notify(title, body, priority="default", tags="", url=""):
     if tags:
         headers["X-Tags"] = _header(tags)
     if url:
+        # Click: tap target in the app and the field the Telegram bridge
+        # forwards; Actions: the explicit "Open" button.
+        headers["Click"] = _header(url)
         headers["Actions"] = _header(f"view, Open, {url}")
-    req = urllib.request.Request(
-        f"{SERVER}/{TOPIC}", data=body.encode("utf-8"), headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300
-    except Exception as exc:
-        print(f"notify: send failed: {exc}", file=sys.stderr, flush=True)
-        return False
+    for attempt in range(len(RETRY_DELAYS_S) + 1):
+        req = urllib.request.Request(
+            f"{SERVER}/{TOPIC}", data=body.encode("utf-8"), headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return 200 <= resp.status < 300
+        except urllib.error.HTTPError as exc:
+            final = 400 <= exc.code < 500 and exc.code != 429
+            print(f"notify: send failed: {exc}", file=sys.stderr, flush=True)
+            if final:
+                return False
+        except Exception as exc:
+            print(f"notify: send failed: {exc}", file=sys.stderr, flush=True)
+        if attempt < len(RETRY_DELAYS_S):
+            _sleep(RETRY_DELAYS_S[attempt])
+    return False
