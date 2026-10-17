@@ -143,13 +143,25 @@ ADV_LABEL = "approved-adversarial"
 # session prompt or taken as a blocker answer. The repos are public, so any
 # GitHub user can open a fork PR or comment; without this gate a stranger's
 # PR reached a QA session running tests with --auto-approve on the homelab,
-# and a stranger's comment could become "the owner's answer". The owner's
-# Telegram replies are posted as the owner, so they pass. Scheduled
+# and a stranger's comment could become "the owner's answer". Scheduled
 # Actions file `run` issues as app/github-actions.
-TRUSTED_AUTHORS = {
-    a.strip() for a in os.environ.get(
-        "DISPATCH_TRUSTED_AUTHORS",
-        "pennico,app/github-actions,github-actions").split(",") if a.strip()}
+#
+# Owner vs agents (2026-10-17): agent sessions act as their own machine
+# user (pennico-agent), the owner as pennico. Agents are trusted for
+# their PRs, task issues and comments, but only the OWNER can answer a
+# blocker or file a `run` issue: otherwise a session (steered by text it
+# read) could answer its own blocker. The Telegram bridge posts the
+# owner's replies with the owner's token (OWNER_GH_TOKEN), so they pass.
+def _logins(var, default):
+    return {a.strip() for a in os.environ.get(var, default).split(",")
+            if a.strip()}
+
+
+OWNER_AUTHORS = _logins("DISPATCH_OWNER_AUTHORS", "pennico")
+ACTIONS_AUTHORS = {"app/github-actions", "github-actions"}
+TRUSTED_AUTHORS = _logins(
+    "DISPATCH_TRUSTED_AUTHORS",
+    ",".join(sorted(OWNER_AUTHORS | ACTIONS_AUTHORS | {"pennico-agent"})))
 
 # Appended to every dispatcher-filed blocker: the owner is a non-developer
 # reading these on a phone; the answer mechanism must be spelled out.
@@ -421,6 +433,15 @@ def trusted_comments(comments):
     return [c for c in comments or [] if is_trusted(c)]
 
 
+def is_owner(item):
+    """True if authored by the owner (not an agent account)."""
+    return (item.get("author") or {}).get("login") in OWNER_AUTHORS
+
+
+def owner_comments(comments):
+    return [c for c in comments or [] if is_owner(c)]
+
+
 def open_prs():
     """Open PRs from trusted authors on branches of this repo, never forks."""
     prs = gh_json(["gh", "pr", "list", "--json",
@@ -521,9 +542,11 @@ def run_issues():
                       "--json", "number,title,body,labels,author"]) or []
     kept = []
     for i in issues:
-        if not is_trusted(i):
+        login = (i.get("author") or {}).get("login")
+        if not (is_owner(i) or login in ACTIONS_AUTHORS):
             log(f"ignoring run issue #{i.get('number')} by "
-                f"{(i.get('author') or {}).get('login', '?')}: untrusted author")
+                f"{login or '?'}: only the owner or scheduled Actions may "
+                "file run issues")
             continue
         kept.append(i)
     return kept
@@ -1287,7 +1310,17 @@ def tick(dry):
         if dry:
             log(f"would resume after blocker #{issue['number']} was answered")
             return "worked"
-        comments = trusted_comments(issue_comments(issue["number"]))
+        comments = owner_comments(issue_comments(issue["number"]))
+        if not comments and issue["state"] == "OPEN":
+            # `answered` added without an owner comment (e.g. by an agent
+            # session): not an answer. Drop the label and keep waiting.
+            log(f"blocker #{issue['number']}: `answered` label without an "
+                "owner comment; ignoring")
+            if not dry:
+                run(["gh", "issue", "edit", str(issue["number"]),
+                     "--remove-label", "answered"])
+            maybe_save(state, dry)
+            return "blocked"
         answer = (comments[-1].get("body", "").strip() if comments
                   else "The owner closed the issue without a comment; "
                        "use your best judgment.")

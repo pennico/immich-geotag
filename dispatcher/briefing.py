@@ -23,10 +23,14 @@ BRIEF_DIR = REPO / "dispatcher" / "briefings"
 
 # Same env var and default as dispatch.TRUSTED_AUTHORS (kept separate:
 # engine copies may ship without this module; a test pins them equal).
+_OWNERS = {a.strip() for a in os.environ.get(
+    "DISPATCH_OWNER_AUTHORS", "pennico").split(",") if a.strip()}
 TRUSTED_AUTHORS = {
     a.strip() for a in os.environ.get(
         "DISPATCH_TRUSTED_AUTHORS",
-        "pennico,app/github-actions,github-actions").split(",") if a.strip()}
+        ",".join(sorted(_OWNERS | {"app/github-actions", "github-actions",
+                                   "pennico-agent"}))).split(",")
+    if a.strip()}
 
 HEADER = ("<!-- briefing: pr {number} | head {head} | generated {generated} "
           "-->\n")

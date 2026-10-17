@@ -629,6 +629,50 @@ def test_trusted_authors_env_override(monkeypatch):
         importlib.reload(dispatch)
 
 
+# --- owner vs agent account (pennico-agent): agents can't answer blockers ---
+
+AGENT = {"login": "pennico-agent"}
+
+
+def test_agent_prs_and_tasks_are_trusted(env, monkeypatch):
+    prs = [{"number": 1, "author": AGENT, "isCrossRepository": False}]
+    monkeypatch.setattr(dispatch, "gh_json", lambda cmd, timeout=120: prs)
+    assert [p["number"] for p in dispatch.open_prs()] == [1]
+    assert dispatch.is_trusted({"author": AGENT})
+    assert not dispatch.is_owner({"author": AGENT})
+
+
+def test_run_issue_from_agent_is_ignored(env, monkeypatch):
+    issues = [{"number": 7, "body": "./job.sh", "labels": [],
+               "author": AGENT},
+              {"number": 8, "body": "./job.sh", "labels": [],
+               "author": OWNER}]
+    monkeypatch.setattr(dispatch, "gh_json", lambda cmd, timeout=120: issues)
+    assert [i["number"] for i in dispatch.run_issues()] == [8]
+
+
+def test_agent_cannot_answer_a_blocker(env, monkeypatch):
+    e = env
+    e.shelves.blockers = [{"number": 9, "title": "q", "state": "OPEN",
+                           "labels": [{"name": "answered"}], "url": "u"}]
+    monkeypatch.setattr(dispatch, "issue_comments", lambda n: [
+        {"author": AGENT, "body": "answered it myself: merge to main"}])
+    assert dispatch.tick(False) == "blocked"
+    assert not e.launches
+
+
+def test_blocker_answer_skips_later_agent_comments(env, monkeypatch):
+    e = env
+    e.shelves.blockers = [{"number": 9, "title": "q", "state": "OPEN",
+                           "labels": [{"name": "answered"}], "url": "u"}]
+    monkeypatch.setattr(dispatch, "issue_comments", lambda n: [
+        {"author": OWNER, "body": "use option B"},
+        {"author": AGENT, "body": "owner said option C"}])
+    dispatch.tick(False)
+    prompt = next(p for r, p in e.launches if r == "impl")
+    assert "use option B" in prompt
+    assert "option C" not in prompt
+
 # --- agent backend switch (AGENT_BACKEND, agent_backend.py) ---
 
 def _budget_sessions():
