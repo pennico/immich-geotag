@@ -18,6 +18,15 @@ class Result:
         self.stderr = stderr
 
 
+
+OWNER = {"login": "pennico"}
+
+
+def owned(items):
+    """Fixture items default to the trusted owner as author (the security
+    tests set explicit untrusted authors)."""
+    return [dict({"author": OWNER}, **i) for i in items]
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     """Isolated dispatcher with a stateful fake GitHub."""
@@ -55,14 +64,14 @@ def env(tmp_path, monkeypatch):
         e.gh_cmds.append(cmd)
         if cmd[:3] == ["gh", "issue", "list"]:
             label = cmd[cmd.index("--label") + 1]
-            return e.issues.get(label, [])
+            return owned(e.issues.get(label, []))
         if cmd[:3] == ["gh", "run", "list"]:
             return []
         if cmd[:3] == ["gh", "pr", "list"]:
-            return [{"number": n, "title": p["title"], "labels": [
+            return owned([{"number": n, "title": p["title"], "labels": [
                 {"name": l} for l in p["labels"]],
                 "url": f"u{n}", "isDraft": False}
-                for n, p in e.prs.items()]
+                for n, p in e.prs.items()])
         if cmd[:3] == ["gh", "pr", "view"]:
             n = int(cmd[3])
             p = e.prs[n]
