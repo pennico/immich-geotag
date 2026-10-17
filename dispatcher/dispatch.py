@@ -128,6 +128,7 @@ VERIFY_PER_MERGE = os.environ.get("DISPATCH_VERIFY_PER_MERGE", "").lower() \
 MAX_PRICE = os.environ.get("DISPATCH_MAX_PRICE", "10")
 SESSION_TIMEOUT_S = 5400
 RUN_TIMEOUT_S = 3600    # direct script jobs (`run` issues), no LLM session
+BLOCKER_REMIND_S = 24 * 3600  # re-notify an unanswered blocker daily
 FAIL_STRIKES = 2   # failed sessions per roadmap item before pausing
 QA_STRIKES = 2     # QA passes per PR without approval before pausing
 LOOP_SETTLE_S = 30  # pause between sessions in --loop mode
@@ -498,8 +499,11 @@ def merge(number, title, is_draft=False):
 
 
 def blocker_issues():
+    """All blocker issues (open and closed); None when gh failed — the
+    caller aborts the tick instead of reading a failure as "no blockers"."""
     return gh_json(["gh", "issue", "list", "--label", "blocker", "--state", "all",
-                    "--json", "number,title,state,labels,url"]) or []
+                    "--limit", "500",
+                    "--json", "number,title,state,labels,url"])
 
 def task_issues():
     return [i for i in gh_json(["gh", "issue", "list", "--label", "task",
@@ -574,13 +578,14 @@ def execute_run_issue(issue, dry):
              "`answered` label to resume."])
         run(["gh", "issue", "edit", str(n), "--add-label", "blocker"])
         state = load_state()
-        state.setdefault("seen_blockers", []).append(n)
+        reblock(state, n)
+        if notify.notify(f"{REPO_NAME}: run job failed — needs your attention",
+                         f"#{n} {issue['title']}\n\n"
+                         "Comment on the issue and add the `answered` label "
+                         "(or reply here) to resume.",
+                         priority="high", tags="warning"):
+            state.setdefault("seen_blockers", []).append(n)
         save_state(state)
-        notify.notify(f"{REPO_NAME}: run job failed — needs your attention",
-                      f"#{n} {issue['title']}\n\n"
-                      "Comment on the issue and add the `answered` label "
-                      "(or reply here) to resume.",
-                      priority="high", tags="warning")
     return "worked"
 
 
@@ -598,6 +603,42 @@ def file_blocker(title, body):
         return None
     m = re.search(r"/issues/(\d+)", r.stdout.strip())
     return int(m.group(1)) if m else None
+
+
+def remind_blockers(state, issues):
+    """Re-notify open, unanswered, already-announced blockers once per
+    BLOCKER_REMIND_S: a push lost on the way (phone off, Telegram
+    bridge down) must not leave the repo paused silently for days."""
+    now = time.time()
+    for issue in issues:
+        key = str(issue["number"])
+        if issue["number"] not in state["seen_blockers"]:
+            continue  # not announced yet: the gate retries that itself
+        last = state["blocker_reminded"].get(key)
+        if last is None:  # announced before reminders existed
+            state["blocker_reminded"][key] = now
+            continue
+        if now - last < BLOCKER_REMIND_S:
+            continue
+        if notify.notify(f"{REPO_NAME}: still waiting for your answer",
+                         f"#{issue['number']} {issue['title']}\n\n"
+                         "This repo stays paused until you answer: reply "
+                         "here (Telegram) or comment on the issue and add "
+                         "the `answered` label.",
+                         priority="high", tags="hourglass",
+                         url=issue.get("url", "")):
+            state["blocker_reminded"][key] = now
+
+
+def reblock(state, n):
+    """An issue that gets the `blocker` label (again): forget that it was
+    announced or resumed, so the gate announces it and the owner's next
+    `answered` resumes it — a previously resumed number would otherwise
+    be skipped by the gate forever."""
+    for key in ("seen_blockers", "resumed_blockers"):
+        if n in state.get(key, []):
+            state[key].remove(n)
+    state.get("blocker_reminded", {}).pop(str(n), None)
 
 
 def first_roadmap_item():
@@ -1137,7 +1178,8 @@ def tick(dry):
                          ("main_ci_fixed_runs", []), ("main_ci_strikes", 0),
                          ("main_ci_escalated_runs", []),
                          ("verified_merges", []), ("verified_idle", False),
-                         ("notified_done", False)):
+                         ("notified_done", False),
+                         ("blocker_reminded", {})):
         state.setdefault(key, default)
 
     if not dry:
@@ -1149,15 +1191,22 @@ def tick(dry):
         return "abort"
     for issue in blockers:
         if issue["number"] not in state["seen_blockers"]:
-            state["seen_blockers"].append(issue["number"])
             log(f"blocker issue #{issue['number']} ({issue['state'].lower()}): {issue['title']}")
-            if not dry and issue["state"] == "OPEN":
-                notify.notify(f"{REPO_NAME}: needs your answer",
-                              f"#{issue['number']} {issue['title']}\n\n"
-                              "Reply to this message (Telegram) or comment "
-                              "on the issue and add the `answered` label — "
-                              "the loop resumes within ~5 min.",
-                              priority="high", tags="warning", url=issue.get("url"))
+            if dry:
+                continue
+            # Seen only once the owner was actually told: a failed send
+            # (ntfy down) is retried next tick instead of being lost.
+            sent = True
+            if issue["state"] == "OPEN":
+                sent = notify.notify(f"{REPO_NAME}: needs your answer",
+                                     f"#{issue['number']} {issue['title']}\n\n"
+                                     "Reply to this message (Telegram) or comment "
+                                     "on the issue and add the `answered` label — "
+                                     "the loop resumes within ~5 min.",
+                                     priority="high", tags="warning", url=issue.get("url"))
+            if sent:
+                state["seen_blockers"].append(issue["number"])
+                state["blocker_reminded"][str(issue["number"])] = time.time()
     # --- run issues: direct script jobs, no LLM session ---
     # Before the blocker gate and the session pauses: calendar jobs
     # (monthly backfills) must fire on schedule even while the repo
@@ -1182,6 +1231,8 @@ def tick(dry):
     if open_unanswered:
         log(f"blocked: {len(open_unanswered)} unanswered blocker issue(s); "
             "waiting for the owner")
+        if not dry:
+            remind_blockers(state, open_unanswered)
         maybe_save(state, dry)
         return "blocked"
     # --- session-launch pauses: API-quota cooldown, daily budget ---
@@ -1258,14 +1309,14 @@ def tick(dry):
                             "look, then comment here and add the "
                             "`answered` label to resume.")
                         if b:
-                            state["seen_blockers"].append(b["number"])
-                            notify.notify(
+                            if notify.notify(
                                 f"{REPO_NAME}: paused — CI keeps failing on main",
-                                f"{r.get('displayTitle', '')}\n\n"
+                                f"#{b} {r.get('displayTitle', '')}\n\n"
                                 "Automatic fixes did not clear it. Comment "
                                 "on the issue and add the `answered` "
                                 "label (or reply here) to resume.",
-                                priority="high", tags="warning")
+                                priority="high", tags="warning"):
+                                state["seen_blockers"].append(b)
                     maybe_save(state, dry)
             else:
                 state["main_ci_fixed_runs"].append(rid)
@@ -1352,13 +1403,14 @@ def tick(dry):
                      "sessions (see dispatcher/logs/). Pausing this repo; "
                      "comment here and add the `answered` label to resume."])
                 run(["gh", "issue", "edit", str(n), "--add-label", "blocker"])
-                state["seen_blockers"].append(n)
-                notify.notify(f"{REPO_NAME}: paused — needs your attention",
-                              f"#{n} {issue['title']}\n\n"
-                              "Two sessions failed on this task. Comment on "
-                              "the issue and add the `answered` label (or "
-                              "reply here) to resume.",
-                              priority="high", tags="warning", url=issue.get("url"))
+                reblock(state, n)
+                if notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                 f"#{n} {issue['title']}\n\n"
+                                 "Two sessions failed on this task. Comment on "
+                                 "the issue and add the `answered` label (or "
+                                 "reply here) to resume.",
+                                 priority="high", tags="warning", url=issue.get("url")):
+                    state["seen_blockers"].append(n)
                 maybe_save(state, dry)
                 return "blocked"
         maybe_save(state, dry)
@@ -1452,15 +1504,15 @@ def tick(dry):
                             "look at the PR, then comment here and add the "
                             "`answered` label to resume.")
                         if b:
-                            state["seen_blockers"].append(b)
-                            notify.notify(f"{REPO_NAME}: paused — needs your attention",
-                                          f"#{b} CI keeps failing on PR #{p['number']}\n\n"
-                                          "The loop could not fix it automatically. "
-                                          "Comment on the issue and add the "
-                                          "`answered` label (or reply here) "
-                                          "to resume.",
-                                          priority="high", tags="warning",
-                                          url=p.get("url"))
+                            if notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                             f"#{b} CI keeps failing on PR #{p['number']}\n\n"
+                                             "The loop could not fix it automatically. "
+                                             "Comment on the issue and add the "
+                                             "`answered` label (or reply here) "
+                                             "to resume.",
+                                             priority="high", tags="warning",
+                                             url=p.get("url")):
+                                state["seen_blockers"].append(b)
                 waiting = True
                 continue
             if state_ != "green":
@@ -1574,14 +1626,14 @@ def tick(dry):
                         "paused this repo. Please take a look, then comment "
                         "here and add the `answered` label to resume.")
                     if b:
-                        state["seen_blockers"].append(b)
-                        notify.notify(f"{REPO_NAME}: paused — needs your attention",
-                                      f"#{b} {p['title']}\n\n"
-                                      f"PR #{n} failed {QA_STRIKES} review "
-                                      "rounds. Comment on the issue and add "
-                                      "the `answered` label (or reply here) "
-                                      "to resume.",
-                                      priority="high", tags="warning", url=p.get("url"))
+                        if notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                         f"#{b} {p['title']}\n\n"
+                                         f"PR #{n} failed {QA_STRIKES} review "
+                                         "rounds. Comment on the issue and add "
+                                         "the `answered` label (or reply here) "
+                                         "to resume.",
+                                         priority="high", tags="warning", url=p.get("url")):
+                            state["seen_blockers"].append(b)
                     pause = True
                     continue
                 log(f"PR #{n} failed {role} review (strike {strikes}); launching rework")
@@ -1612,14 +1664,14 @@ def tick(dry):
                         "comment here and add the `answered` label to "
                         "resume.")
                     if b:
-                        state["seen_blockers"].append(b)
-                        notify.notify(f"{REPO_NAME}: paused — needs your attention",
-                                      f"#{b} {p['title']}\n\n"
-                                      f"PR #{n}: rework pushed no changes. "
-                                      "Comment on the issue and add the "
-                                      "`answered` label (or reply here) "
-                                      "to resume.",
-                                      priority="high", tags="warning", url=p.get("url"))
+                        if notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                         f"#{b} {p['title']}\n\n"
+                                         f"PR #{n}: rework pushed no changes. "
+                                         "Comment on the issue and add the "
+                                         "`answered` label (or reply here) "
+                                         "to resume.",
+                                         priority="high", tags="warning", url=p.get("url")):
+                            state["seen_blockers"].append(b)
                     pause = True
                     continue
                 if "approved" in after:
@@ -1648,13 +1700,13 @@ def tick(dry):
                 "repo. Please take a look, then comment here and add the "
                 "`answered` label to resume.")
             if n:
-                state["seen_blockers"].append(n)
-                notify.notify(f"{REPO_NAME}: paused — needs your attention",
-                              f"#{n} roadmap item failed twice\n\n"
-                              f"Item: {item}\n\n"
-                              "Comment on the issue and add the `answered` "
-                              "label (or reply here) to resume.",
-                              priority="high", tags="warning")
+                if notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                 f"#{n} roadmap item failed twice\n\n"
+                                 f"Item: {item}\n\n"
+                                 "Comment on the issue and add the `answered` "
+                                 "label (or reply here) to resume.",
+                                 priority="high", tags="warning"):
+                    state["seen_blockers"].append(n)
                 maybe_save(state, dry)
                 return "blocked"
             return "abort"
@@ -1688,13 +1740,13 @@ def tick(dry):
                     "this repo. Please take a look, then comment here and add "
                     "the `answered` label to resume.")
                 if n:
-                    state["seen_blockers"].append(n)
-                    notify.notify(f"{REPO_NAME}: paused — needs your attention",
-                                  f"#{n} roadmap item failed twice\n\n"
-                                  f"Item: {item}\n\n"
-                                  "Comment on the issue and add the `answered` "
-                                  "label (or reply here) to resume.",
-                                  priority="high", tags="warning")
+                    if notify.notify(f"{REPO_NAME}: paused — needs your attention",
+                                     f"#{n} roadmap item failed twice\n\n"
+                                     f"Item: {item}\n\n"
+                                     "Comment on the issue and add the `answered` "
+                                     "label (or reply here) to resume.",
+                                     priority="high", tags="warning"):
+                        state["seen_blockers"].append(n)
                     maybe_save(state, dry)
                     return "blocked"
                 return "abort"
