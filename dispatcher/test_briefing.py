@@ -13,7 +13,6 @@ from types import SimpleNamespace
 
 import briefing
 import dispatch
-
 import pytest
 
 
