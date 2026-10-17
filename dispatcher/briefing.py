@@ -12,6 +12,7 @@ gh; the PR is fetched exactly once per tick.
 All calls are best-effort: a failed briefing write must never block a
 tick — the session falls back to fetching from GitHub itself.
 """
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -19,6 +20,13 @@ from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 BRIEF_DIR = REPO / "dispatcher" / "briefings"
+
+# Same env var and default as dispatch.TRUSTED_AUTHORS (kept separate:
+# engine copies may ship without this module; a test pins them equal).
+TRUSTED_AUTHORS = {
+    a.strip() for a in os.environ.get(
+        "DISPATCH_TRUSTED_AUTHORS",
+        "pennico,app/github-actions,github-actions").split(",") if a.strip()}
 
 HEADER = ("<!-- briefing: pr {number} | head {head} | generated {generated} "
           "-->\n")
@@ -33,6 +41,26 @@ def _run(cmd, timeout=120):
         return SimpleNamespace(returncode=127, stdout="", stderr="")
 
 
+def _trusted_comment_text(raw):
+    """Comments + review bodies from trusted authors only: this file is fed
+    to sessions, and the repos are public, so a stranger's comment must
+    not reach a prompt."""
+    import json
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        return "(comments unavailable)"
+    items = (data.get("comments") or []) + (data.get("reviews") or [])
+    items.sort(key=lambda c: c.get("createdAt") or c.get("submittedAt") or "")
+    lines = []
+    for c in items:
+        login = (c.get("author") or {}).get("login", "?")
+        body = (c.get("body") or "").strip()
+        if login in TRUSTED_AUTHORS and body:
+            lines.append(f"- {login}: {body}")
+    return "\n".join(lines) or "(no comments)"
+
+
 def write_briefing(number):
     """(Re)generate briefings/pr-<n>.md: diff + comments + metadata.
 
@@ -44,7 +72,7 @@ def write_briefing(number):
     meta = _run(["gh", "pr", "view", str(number),
                  "--json", "number,title,headRefOid,labels,isDraft"])
     diff = _run(["gh", "pr", "diff", str(number)])
-    comments = _run(["gh", "pr", "view", str(number), "--comments"])
+    comments = _run(["gh", "pr", "view", str(number), "--json", "comments,reviews"])
     if meta.returncode != 0 or diff.returncode != 0:
         return None
     try:
@@ -62,7 +90,7 @@ def write_briefing(number):
         f"State: {'draft' if m.get('isDraft') else 'ready for review'}"
         f" | Labels: {labels}\n",
         "\n## Comments (reviews and discussion)\n\n",
-        (comments.stdout or "(no comments)").strip() + "\n",
+        _trusted_comment_text(comments.stdout) + "\n",
         "\n## Diff\n\n```diff\n",
         (diff.stdout or "(empty diff)").strip() + "\n",
         "```\n",

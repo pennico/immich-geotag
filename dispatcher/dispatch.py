@@ -136,6 +136,19 @@ LOG_DELETE_DAYS = 30  # delete rotated logs older than this
 REPO_NAME = "immich-geotag"
 ADV_LABEL = "approved-adversarial"
 
+# Only these GitHub authors may steer the loop: open PRs that get reviewed
+# and merged, file `run`/`task` issues, or have their comments fed into a
+# session prompt or taken as a blocker answer. The repos are public, so any
+# GitHub user can open a fork PR or comment; without this gate a stranger's
+# PR reached a QA session running tests with --auto-approve on the homelab,
+# and a stranger's comment could become "the owner's answer". The owner's
+# Telegram replies are posted as the owner, so they pass. Scheduled
+# Actions file `run` issues as app/github-actions.
+TRUSTED_AUTHORS = {
+    a.strip() for a in os.environ.get(
+        "DISPATCH_TRUSTED_AUTHORS",
+        "pennico,app/github-actions,github-actions").split(",") if a.strip()}
+
 # Appended to every dispatcher-filed blocker: the owner is a non-developer
 # reading these on a phone; the answer mechanism must be spelled out.
 BLOCKER_HOWTO = ("\n\n---\n\n**How to answer:** comment below, then add the "
@@ -397,8 +410,30 @@ def ensure_labels():
         run(["gh", "label", "create", name, "--color", color])
 
 
+def is_trusted(item):
+    """True if a PR/issue/comment (gh JSON) was authored by a trusted login."""
+    return (item.get("author") or {}).get("login") in TRUSTED_AUTHORS
+
+
+def trusted_comments(comments):
+    return [c for c in comments or [] if is_trusted(c)]
+
+
 def open_prs():
-    return gh_json(["gh", "pr", "list", "--json", "number,title,labels,url,isDraft"])
+    """Open PRs from trusted authors on branches of this repo, never forks."""
+    prs = gh_json(["gh", "pr", "list", "--json",
+                   "number,title,labels,url,isDraft,author,isCrossRepository"])
+    if prs is None:
+        return None
+    kept = []
+    for p in prs:
+        if p.get("isCrossRepository") or not is_trusted(p):
+            log(f"ignoring PR #{p.get('number')} by "
+                f"{(p.get('author') or {}).get('login', '?')}: not a trusted "
+                "same-repo PR")
+            continue
+        kept.append(p)
+    return kept
 
 
 def pr_labels(number):
@@ -467,15 +502,26 @@ def blocker_issues():
                     "--json", "number,title,state,labels,url"]) or []
 
 def task_issues():
-    return gh_json(["gh", "issue", "list", "--label", "task",
-                    "--state", "open", "--json", "number,title"]) or []
+    return [i for i in gh_json(["gh", "issue", "list", "--label", "task",
+                                "--state", "open", "--json",
+                                "number,title,author"]) or []
+            if is_trusted(i)]
+
 
 
 def run_issues():
     """Open issues labeled `run`: direct script jobs, no LLM session."""
-    return gh_json(["gh", "issue", "list", "--label", "run",
-                    "--state", "open",
-                    "--json", "number,title,body,labels"]) or []
+    issues = gh_json(["gh", "issue", "list", "--label", "run",
+                      "--state", "open",
+                      "--json", "number,title,body,labels,author"]) or []
+    kept = []
+    for i in issues:
+        if not is_trusted(i):
+            log(f"ignoring run issue #{i.get('number')} by "
+                f"{(i.get('author') or {}).get('login', '?')}: untrusted author")
+            continue
+        kept.append(i)
+    return kept
 
 
 def execute_run_issue(issue, dry):
@@ -1152,7 +1198,7 @@ def tick(dry):
         if dry:
             log(f"would resume after blocker #{issue['number']} was answered")
             return "worked"
-        comments = issue_comments(issue["number"]) or []
+        comments = trusted_comments(issue_comments(issue["number"]))
         answer = (comments[-1].get("body", "").strip() if comments
                   else "The owner closed the issue without a comment; "
                        "use your best judgment.")
@@ -1251,10 +1297,10 @@ def tick(dry):
 
     # --- task issues: owner-filed work orders (launch from the phone) ---
     tasks = gh_json(["gh", "issue", "list", "--label", "task",
-                     "--state", "open", "--json", "number,title,url"])
+                     "--state", "open", "--json", "number,title,url,author"])
     if tasks is None:
         return "abort"
-    for issue in tasks:
+    for issue in (t for t in tasks if is_trusted(t)):
         if issue["number"] in state["launched_tasks"]:
             continue
         n = issue["number"]
@@ -1264,7 +1310,7 @@ def tick(dry):
         data = gh_json(["gh", "issue", "view", str(n),
                         "--json", "body,comments"]) or {}
         body = (data.get("body") or "").strip() or "(no body)"
-        comments = data.get("comments") or []
+        comments = trusted_comments(data.get("comments"))
         ctext = ""
         if comments:
             ctext = "\nIssue comments:\n" + "\n".join(
