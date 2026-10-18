@@ -191,3 +191,19 @@ def test_guard_vibe_mode_unchanged():
     out = _guard({"tool_name": "bash", "tool_input": {"command": "sudo ls"}})
     assert out["decision"] == "deny"
     assert _guard({"tool_name": "Bash", "tool_input": {"command": "sudo ls"}}) is None
+
+
+def test_claude_gets_bash_rules_and_plumbing_tools(monkeypatch):
+    monkeypatch.delenv("DISPATCH_CLAUDE_ALLOWED_TOOLS", raising=False)
+    cmd = backend.build_cmd("claude", "do it", 10, 1)
+    rules = cmd[cmd.index("--append-system-prompt") + 1]
+    assert "ONE plain command" in rules and "do not stop" in rules
+    tools = cmd[cmd.index("--allowedTools") + 1:cmd.index("--max-turns")]
+    assert "Bash(cd:*)" in tools and "Bash(cut:*)" in tools
+    assert not any(t.startswith(("Bash(env", "Bash(timeout", "Bash(bash", "Bash(sh"))
+                   for t in tools)
+
+
+def test_vibe_gets_no_claude_flags():
+    cmd = backend.build_cmd("vibe", "do it", 10, 1)
+    assert "--append-system-prompt" not in cmd
