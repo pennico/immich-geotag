@@ -41,6 +41,9 @@ Last updated: 2026-10-17.
   owner's library in tests or docs), `pyproject.toml` with pinned dev
   tools, CI on Python 3.9 + 3.12, review-app CSRF/Origin/Host guard on
   `POST /apply`, community files.
+- Post-merge check (#41): 375 tests pass, `ruff check` clean; pytest bumped
+  to 9.0.3 (Python ≥3.10; 3.9 CI job stays on 8.4.2); dispatcher test
+  made independent of the ambient `AGENT_BACKEND`.
 
 ## In flight
 
