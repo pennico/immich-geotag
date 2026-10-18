@@ -749,6 +749,7 @@ def test_claude_session_logs_match_role_glob(env, monkeypatch):
 
 
 def test_vibe_session_gets_no_claude_token(env, monkeypatch):
+    monkeypatch.delenv("AGENT_BACKEND", raising=False)  # default backend = vibe
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "secret")
     envs = []
     monkeypatch.setattr(dispatch.subprocess, "Popen",
