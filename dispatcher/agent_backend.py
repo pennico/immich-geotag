@@ -39,7 +39,26 @@ DEFAULT_CLAUDE_TOOLS = ("Read Edit Write Glob Grep TodoWrite "
                         "Bash(/tmp/venv/bin/*) Bash(pytest:*) Bash(ruff:*) "
                         "Bash(ls:*) Bash(cat:*) Bash(head:*) Bash(tail:*) "
                         "Bash(wc:*) Bash(grep:*) Bash(find:*) Bash(sed:*) "
-                        "Bash(mkdir:*) Bash(cp:*) Bash(mv:*) Bash(diff:*)")
+                        "Bash(mkdir:*) Bash(cp:*) Bash(mv:*) Bash(diff:*) "
+                        # shell plumbing models chain into their commands;
+                        # none of these can start another program
+                        "Bash(cd:*) Bash(echo:*) Bash(cut:*) Bash(sort:*) "
+                        "Bash(uniq:*) Bash(tr:*) Bash(pwd:*) Bash(jq:*) "
+                        "Bash(test:*) Bash(true:*)")
+
+# Appended to Claude's system prompt in every headless session. In
+# dontAsk mode a command outside the allow-list is denied without a
+# prompt, and every part of a compound command must match; sessions used
+# to write `for r in ...; do cd ...; gh ... | cut ...; done`, get one
+# denial and give up (2026-10-18: overseer, verify and task sessions).
+CLAUDE_BASH_RULES = (
+    "Unattended run: every Bash command is checked against an allow-list "
+    "and anything else is denied without asking. Run ONE plain command per "
+    "Bash call. No for/while loops, no subshells, no `cd ... &&` or `;` "
+    "chains. Your working directory is already the repository; for other "
+    "repositories use `git -C <dir>` and `gh ... -R pennico/<repo>`. Pipes "
+    "only into head, tail, grep, sort, uniq, cut, tr, wc or jq. If a command "
+    "is denied, do not stop: split it into simple commands and continue.")
 
 
 # The repo's unattended-run guard (.vibe/guard.py: destructive bash, .env
@@ -87,7 +106,8 @@ def build_cmd(backend, prompt, max_turns, max_price, output="json",
                "--max-budget-usd", str(max_price),
                "--output-format", "json",
                "--no-session-persistence",
-               "--settings", json.dumps(GUARD_SETTINGS)]
+               "--settings", json.dumps(GUARD_SETTINGS),
+               "--append-system-prompt", CLAUDE_BASH_RULES]
         model = os.environ.get("DISPATCH_CLAUDE_MODEL", "").strip()
         if model:
             cmd += ["--model", model]
