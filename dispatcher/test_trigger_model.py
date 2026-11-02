@@ -47,6 +47,7 @@ def env(tmp_path, monkeypatch):
                         lambda *a, **k: e.sent.append(a) or True)
     e.sent = []
     e.gh_cmds = []
+    e.label_api_fails = False
     e.runs = []          # non-gh commands (git etc.)
     e.launches = []      # (role, prompt) per run_session call
     e.results = {}       # role -> SessionResult or callable
@@ -108,9 +109,14 @@ def env(tmp_path, monkeypatch):
 
     def recording_run(cmd, timeout=120):
         e.runs.append(cmd)
-        if cmd[:3] == ["gh", "pr", "edit"] and "--add-label" in cmd:
-            n = int(cmd[3])
-            e.prs[n]["labels"].add(cmd[cmd.index("--add-label") + 1])
+        if cmd[:2] == ["gh", "api"] and "/labels" in cmd[4]:
+            if e.label_api_fails:
+                return Result(returncode=1, stderr="HTTP 500: boom")
+            n = int(cmd[4].split("/issues/")[1].split("/")[0])
+            if cmd[3] == "POST":
+                e.prs[n]["labels"].add(cmd[6].split("=", 1)[1])
+            else:
+                e.prs[n]["labels"].discard(cmd[4].rsplit("/", 1)[1])
         return Result()
 
     monkeypatch.setattr(dispatch, "run", recording_run)
@@ -170,6 +176,47 @@ def test_sync_with_approved_gets_adversarial_without_session(env):
     assert status == "worked"
     assert env.launches == []  # no review session for a sync PR
     assert "approved-adversarial" in env.prs[14]["labels"]
+
+
+def test_failed_label_does_not_spin_and_is_retried(env):
+    # 2026-11-02: `gh pr edit` failed unseen, the tick said "worked", and each
+    # worker re-ticked every 37 s forever while the sync PR never merged.
+    add_pr(env, 14, ["dispatcher/dispatch.py"], labels={"approved"})
+    env.label_api_fails = True
+    assert dispatch.tick(dry=False) == "blocked"
+    assert "approved-adversarial" not in env.prs[14]["labels"]
+    env.label_api_fails = False
+    assert dispatch.tick(dry=False) == "worked"
+    assert "approved-adversarial" in env.prs[14]["labels"]
+
+
+def test_set_pr_label_uses_rest_not_gh_pr_edit(env):
+    add_pr(env, 14, ["src/a.py"], labels={"approved"})
+    assert dispatch.set_pr_label(14, "x") is True
+    assert "x" in env.prs[14]["labels"]
+    assert dispatch.set_pr_label(14, "approved", present=False) is True
+    assert "approved" not in env.prs[14]["labels"]
+    assert not [c for c in env.runs if c[:3] == ["gh", "pr", "edit"]]
+
+
+def test_removing_an_absent_label_is_fine(env, monkeypatch):
+    monkeypatch.setattr(dispatch, "run",
+                        lambda cmd, timeout=120: Result(returncode=1, stderr="HTTP 404: Not Found"))
+    assert dispatch.set_pr_label(14, "approved", present=False) is True
+    assert dispatch.set_pr_label(14, "approved") is False
+
+
+def test_stale_approval_that_cannot_be_removed_blocks_the_repo(env):
+    add_pr(env, 14, ["src/a.py"], labels={"approved"})
+    env.label_api_fails = True
+    assert dispatch.drop_approval(14) is False
+    assert env.blockers and "approval" in env.blockers[0]
+    assert "approved" in env.prs[14]["labels"]
+
+
+def test_review_prompts_do_not_use_gh_pr_edit():
+    assert "gh pr edit" not in dispatch.QA_PROMPT
+    assert "gh pr edit" not in dispatch.ADV_PROMPT
 
 
 # --- strike cap: sync PRs get one rework round, then a blocker ---
