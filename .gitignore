@@ -1,0 +1,41 @@
+.env
+*.csv
+testdata/
+dispatcher/logs/
+dispatcher/.lock
+__pycache__/
+*.pyc
+.DS_Store
+dispatcher/state.json
+geotag-data/
+dispatcher/feedback_state.json
+dispatcher/briefings/
+
+# Secrets / local env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Tool caches and build output
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+*.log
+
+# Photos and generated review pages (may contain personal data)
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.HEIC
+*.JPG
+*.JPEG
+!docs/**/*.png   # documentation screenshots (synthetic data only)
+*-review-app/
+
+# Editors
+.idea/
+.vscode/

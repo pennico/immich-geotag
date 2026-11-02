@@ -1,0 +1,7 @@
+# Dev tools, pinned. Keep in sync with [project.optional-dependencies].dev
+# in pyproject.toml. Runtime dependencies: none (stdlib only).
+# pytest 9 needs Python >=3.10; 9.0.3 closes the tmpdir advisory. 3.9 (CI
+# test floor only) stays on 8.4.2.
+pytest==9.0.3; python_version >= "3.10"
+pytest==8.4.2; python_version < "3.10"
+ruff==0.17.0
