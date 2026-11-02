@@ -170,19 +170,20 @@ session, short status docs) are in `AGENTIC_WORK_STANDARDS.md` under
 
 ## Notifications
 
-`dispatcher/notify.py` sends push notifications via ntfy (outbound HTTPS
-only — nothing is exposed inbound). Set `NTFY_TOPIC` in the runner's
-environment (optionally `NTFY_SERVER` to self-host). Without a topic,
-notifications are a silent no-op. Events: blocker filed (high), failure
+`dispatcher/notify.py` writes one JSON file per event to a spool directory
+(`NOTIFY_SPOOL_DIR`, else `$PROJECTS_DIR/.notify-spool`); a separate process
+drains it to the phone (the Telegram bridge in this setup). Without either
+variable, notifications are a silent no-op. Events: blocker filed (high), failure
 budget hit (high), roadmap done (high), PR opened/approved/merged
-(default). Failures to send are logged, never fatal — GitHub issues are
+(default). A failed write is logged, never fatal — GitHub issues are
 the durable record.
 
 Delivery rules:
-- `notify()` retries network errors, 5xx and 429 responses up to 3
-  times. A 4xx (auth or ACL) response fails at once.
-- A blocker goes into `seen_blockers` only after ntfy accepted its
-  announcement. A failed send is retried on the next tick.
+- `notify()` returns True once the event is on disk. The bridge deletes it
+  only after Telegram accepts it, so an outage delays an alert and does not
+  lose it. A crash in between can repeat a message.
+- A blocker goes into `seen_blockers` only after `notify()` returned True. A
+  failed write is retried on the next tick.
 - An open, unanswered blocker is re-announced every 24 h
   (`blocker_reminded` in state.json, `BLOCKER_REMIND_S`).
 - An issue that gets the `blocker` label again (failed task or run

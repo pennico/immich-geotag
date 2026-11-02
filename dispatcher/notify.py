@@ -1,73 +1,95 @@
 #!/usr/bin/env python3
-"""Best-effort push notifications via ntfy (outbound HTTPS only).
+"""Durable notifications: one JSON file per event in a spool directory.
 
-Set NTFY_TOPIC in the environment (optionally NTFY_SERVER to self-host,
-NTFY_TOKEN if the instance requires auth). Without a topic, notify() is a
-silent no-op. Failures are logged to stderr and never raised: notifications
-are best-effort, GitHub issues are the durable record. A send that fails on
-the network, a 5xx or a 429 is retried (RETRY_DELAYS_S); a 4xx is final
-(auth/ACL errors do not heal by retrying). Callers that must not lose a
-notification (blocker announcements) check the return value and retry on
-a later tick.
+notify() writes the event atomically and returns True once it is on disk.
+A separate process (the Telegram bridge in this setup) drains the directory
+and deletes each file after delivery, so an event raised while that process
+or its network is down is delivered later. Nothing here needs a network or a
+credential.
+
+The directory is NOTIFY_SPOOL_DIR, else $PROJECTS_DIR/.notify-spool. With
+neither set, notify() is a silent no-op that returns False. A failed write is
+logged to stderr and never raised: GitHub issues are the durable record.
+Callers that must not lose a notification (blocker announcements) check the
+return value and retry on a later tick.
+
+Shell jobs use the command line form:
+    python3 notify.py --priority high -- "title" "body"
+which exits non-zero if the event could not be written.
 """
+import argparse
+import json
 import os
+import secrets
 import sys
+import tempfile
 import time
-import urllib.error
-import urllib.request
 
-SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
-TOPIC = os.environ.get("NTFY_TOPIC", "")
-TOKEN = os.environ.get("NTFY_TOKEN", "")
-PRIORITIES = {"min": "1", "default": "3", "high": "4"}
-RETRY_DELAYS_S = (2, 5)   # pauses between the up-to-3 attempts
-_sleep = time.sleep       # patched in tests
-
-# HTTP headers are latin-1; titles and tags carry agent prose with
-# em-dashes and curly quotes that would crash the send (2026-10-07:
-# "'latin-1' codec can't encode character '\\u2014'"). Transliterate
-# the common punctuation, replace anything else.
-_ASCII_MAP = {"\u2014": "--", "\u2013": "-", "\u2018": "'",
-              "\u2019": "'", "\u201c": '"', "\u201d": '"',
-              "\u2026": "...", "\u2192": "->", "\u00a0": " "}
+PRIORITIES = {"min": 1, "default": 3, "high": 4}
 
 
-def _header(value):
-    """Latin-1-safe header value: transliterate, then replace the rest."""
-    out = "".join(_ASCII_MAP.get(ch, ch) for ch in value)
-    return out.encode("latin-1", "replace").decode("latin-1")
+def spool_dir():
+    """The spool directory from the environment, or "" when not configured."""
+    explicit = os.environ.get("NOTIFY_SPOOL_DIR", "")
+    if explicit:
+        return explicit
+    projects = os.environ.get("PROJECTS_DIR", "")
+    return os.path.join(projects, ".notify-spool") if projects else ""
 
 
 def notify(title, body, priority="default", tags="", url=""):
-    """Send one push notification. Returns True if ntfy accepted it."""
-    if not TOPIC:
+    """Queue one notification. Returns True once it is safely on disk."""
+    spool = spool_dir()
+    if not spool:
         return False
-    headers = {
-        "X-Title": _header(title),
-        "X-Priority": PRIORITIES.get(priority, PRIORITIES["default"]),
-    }
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    if tags:
-        headers["X-Tags"] = _header(tags)
-    if url:
-        # Click: tap target in the app and the field the Telegram bridge
-        # forwards; Actions: the explicit "Open" button.
-        headers["Click"] = _header(url)
-        headers["Actions"] = _header(f"view, Open, {url}")
-    for attempt in range(len(RETRY_DELAYS_S) + 1):
-        req = urllib.request.Request(
-            f"{SERVER}/{TOPIC}", data=body.encode("utf-8"), headers=headers)
+    event = {"title": title, "message": body, "tags": tags, "url": url,
+             "priority": PRIORITIES.get(priority, PRIORITIES["default"]),
+             "time": time.time()}
+    # Sorted by name is oldest first. The rename publishes the file whole,
+    # and the reader skips the dot-prefixed temp name.
+    name = f"{time.time_ns():020d}-{os.getpid()}-{secrets.token_hex(4)}.json"
+    tmp = None
+    try:
+        os.makedirs(spool, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=spool)
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            json.dump(event, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.rename(tmp, os.path.join(spool, name))
+        tmp = None
+        dir_fd = os.open(spool, os.O_RDONLY)
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return 200 <= resp.status < 300
-        except urllib.error.HTTPError as exc:
-            final = 400 <= exc.code < 500 and exc.code != 429
-            print(f"notify: send failed: {exc}", file=sys.stderr, flush=True)
-            if final:
-                return False
-        except Exception as exc:
-            print(f"notify: send failed: {exc}", file=sys.stderr, flush=True)
-        if attempt < len(RETRY_DELAYS_S):
-            _sleep(RETRY_DELAYS_S[attempt])
-    return False
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        print(f"notify: could not queue {title!r}: {exc}",
+              file=sys.stderr, flush=True)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
+    return True
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Queue one notification.")
+    p.add_argument("title")
+    p.add_argument("body")
+    p.add_argument("--priority", choices=sorted(PRIORITIES), default="default")
+    p.add_argument("--url", default="")
+    args = p.parse_args(argv)
+    if notify(args.title, args.body, priority=args.priority, url=args.url):
+        return 0
+    if not spool_dir():
+        print("notify: no spool configured (NOTIFY_SPOOL_DIR or PROJECTS_DIR)",
+              file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
