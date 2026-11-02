@@ -224,7 +224,7 @@ lacking the `approved` label (`gh pr list`, `gh pr view N`, `gh pr diff N`):
   "notes" section, never as findings.
 - If the PR is good: `gh pr ready N` (if still a draft), then
   `gh label create approved --color 0E8A16 2>/dev/null || true` and
-  `gh pr edit N --add-label approved`.
+  `gh api --method POST 'repos/{owner}/{repo}/issues/N/labels' -f 'labels[]=approved'`.
 - If the PR has problems: `gh pr review N --comment --body "..."` with
   concrete, reproduced findings, and do NOT add the label. If the problems
   need an owner decision, say so explicitly in the comment.
@@ -243,7 +243,8 @@ open PR that has the `approved` label but lacks `approved-adversarial`
 - Reproduce first: every finding must include the command you ran and its
   actual output. If you cannot reproduce it, it is a "note", not a finding.
 - If the PR survives: `gh label create approved-adversarial --color 5319E7
-  2>/dev/null || true` and `gh pr edit N --add-label approved-adversarial`.
+  2>/dev/null || true` and
+  `gh api --method POST 'repos/{owner}/{repo}/issues/N/labels' -f 'labels[]=approved-adversarial'`.
 - If you found reproduced problems: `gh pr review N --comment --body "..."`
   with the reproductions, and do NOT add the label. If the problems need
   an owner decision, say so explicitly in the comment.
@@ -457,6 +458,42 @@ def open_prs():
             continue
         kept.append(p)
     return kept
+
+
+def set_pr_label(number, label, present=True):
+    """Add or remove a PR label. True when the PR ends up as asked.
+
+    Uses the REST API: `gh pr edit` also needs the read:org scope, which the
+    agent token does not have, so it fails. Ignoring that failure stalled
+    every engine sync, and could leave a stale `approved` on reworked code.
+    gh api fills in {owner}/{repo} from this clone.
+    """
+    path = f"repos/{{owner}}/{{repo}}/issues/{number}/labels"
+    if present:
+        r = run(["gh", "api", "--method", "POST", path, "-f", f"labels[]={label}"])
+    else:
+        r = run(["gh", "api", "--method", "DELETE", f"{path}/{label}"])
+    if r.returncode == 0:
+        return True
+    if not present and "404" in (r.stderr or ""):
+        return True     # already gone
+    log(f"PR #{number}: could not {'add' if present else 'remove'} label "
+        f"{label}: {(r.stderr or '').strip()[:200]}")
+    return False
+
+
+def drop_approval(number):
+    """Reworked code needs a new review. True once `approved` is gone; if it
+    cannot be removed, block the repo, or the old approval could merge it."""
+    if set_pr_label(number, "approved", present=False):
+        return True
+    file_blocker(f"Could not remove the approval from PR #{number}",
+                 f"PR #{number} changed after it was approved, and the dispatcher "
+                 "could not remove its `approved` label, so it paused this repo "
+                 "to keep unreviewed code from merging. Please remove the label "
+                 "from the PR, then comment here and add the `answered` label "
+                 "to resume.")
+    return False
 
 
 def pr_labels(number):
@@ -1556,8 +1593,9 @@ def tick(dry):
                             return pause_for_quota_or_budget(state, res, dry)
                         # The fix pushed new code: re-verify correctness
                         # before it can merge (same rule as rework).
-                        run(["gh", "pr", "edit", str(p["number"]),
-                             "--remove-label", "approved"])
+                        if not drop_approval(p["number"]):
+                            maybe_save(state, dry)
+                            return "blocked"
                 elif p["number"] not in state["ci_escalated"]:
                     state["ci_escalated"].append(p["number"])
                     log(f"PR #{p['number']}: CI still red after fix attempt; "
@@ -1646,9 +1684,10 @@ def tick(dry):
                 for p in auto:
                     log(f"PR #{p['number']}: engine sync — fast lane, "
                         "no adversarial session")
-                    if not dry:
-                        run(["gh", "pr", "edit", str(p["number"]),
-                             "--add-label", ADV_LABEL])
+                    if not dry and not set_pr_label(p["number"], ADV_LABEL):
+                        # do not report "worked": that re-ticks at once, forever
+                        maybe_save(state, dry)
+                        return "blocked"
                 targets = [p for p in in_review if p not in auto]
                 if not targets:
                     maybe_save(state, dry)
@@ -1682,7 +1721,8 @@ def tick(dry):
                     # the cap (2026-10-06, issue #21).
                     if label == "approved" and is_engine_sync(n):
                         log(f"PR #{n}: engine sync passed QA — fast lane to merge")
-                        run(["gh", "pr", "edit", str(n), "--add-label", ADV_LABEL])
+                        if not set_pr_label(n, ADV_LABEL):
+                            pause = True
                     continue
                 strikes = state["qa_strikes"].get(str(n), 0) + 1
                 state["qa_strikes"][str(n)] = strikes
@@ -1746,7 +1786,9 @@ def tick(dry):
                     pause = True
                     continue
                 if "approved" in after:
-                    run(["gh", "pr", "edit", str(n), "--remove-label", "approved"])
+                    if not drop_approval(n):
+                        pause = True
+                        continue
                     log(f"PR #{n}: removed `approved` (code changed in rework)")
             maybe_save(state, dry)
             if pause:
