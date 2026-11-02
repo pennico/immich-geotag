@@ -11,5 +11,5 @@ an [impl] session.
 
 Built outside the dispatcher chunks (owner session, 2026-09-29):
 `monthly_geotag.py` — self-running monthly backfill within the Vision
-free tier (usage ledger, never-retry state, ntfy summary). See README.md
+free tier (usage ledger, never-retry state, summary notification). See README.md
 for usage and deployment notes.

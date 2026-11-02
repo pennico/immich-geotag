@@ -15,8 +15,8 @@ window). This runner spends that allowance automatically:
   3. Recognize them via `geotag.py recognize` (same engine, same scoring).
   4. Apply every located row back to Immich via `geotag.py apply` —
      coordinates only; photos are never modified or deleted.
-  5. Record the spend and notify via ntfy (NTFY_TOPIC in the
-     environment; silent no-op without one).
+  5. Record the spend and queue a notification through
+     dispatcher/notify.py (silent no-op where it is not set up).
 
 Safe to re-run at any time: resumable, idempotent, and it never exceeds
 the monthly budget. Manual runs of geotag.py against the same Vision key
@@ -29,7 +29,7 @@ Usage:
   python3 monthly_geotag.py --dry       # scan + plan only, no API calls
 
 Environment (beyond geotag.py's own): GEOTAG_MONTHLY_FREE (default 1000),
-NTFY_SERVER / NTFY_TOPIC / NTFY_TOKEN for the summary notification.
+NOTIFY_SPOOL_DIR or PROJECTS_DIR for the summary notification.
 """
 import argparse
 import csv
@@ -37,7 +37,6 @@ import json
 import os
 import subprocess
 import sys
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -137,23 +136,19 @@ def write_report(results, processed, located, applied, usage_total):
 
 
 def notify(title, body, priority="default"):
-    server = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
-    topic = os.environ.get("NTFY_TOPIC", "")
-    if not topic:
-        return
-    headers = {"X-Title": title,
-               "X-Priority": {"min": "1", "default": "3",
-                              "high": "4"}.get(priority, "3")}
-    token = os.environ.get("NTFY_TOKEN", "")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(f"{server}/{topic}",
-                                 data=body.encode("utf-8"), headers=headers)
+    """Hand the summary to dispatcher/notify.py. Never fatal; the log keeps it."""
+    dispatcher = str(Path(__file__).resolve().parent / "dispatcher")
+    if dispatcher not in sys.path:
+        sys.path.append(dispatcher)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
+        from notify import notify as queue_event
+    except ImportError:
+        log(f"no notifier available: {title}")
+        return
+    try:
+        queue_event(title, body, priority=priority)
     except Exception as exc:
-        log(f"ntfy notify failed (not fatal): {exc}")
+        log(f"notify failed (not fatal): {exc}")
 
 
 def parse_args(argv=None):

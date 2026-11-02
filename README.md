@@ -218,7 +218,7 @@ landmark-detection units per calendar month, automatically:
 - Scans Immich newest-first, recognizes the next unprocessed batch, and
   applies coordinates directly (the user-approved automation of the
   manual review flow).
-- Notifies via ntfy (`NTFY_SERVER`/`NTFY_TOPIC`); `--dry` plans without
+- Queues a summary notification when `dispatcher/notify.py` is present; `--dry` plans without
   API calls, `--limit N` caps a run.
 - Writes a per-month markdown report `geotag-data/reports/YYYY-MM.md`
   (counts + the locations found) — copy it anywhere you like to read
@@ -329,7 +329,7 @@ Environment variables (or a `.env` file next to the scripts — see
 | `GEMINI_API_KEY` | Gemini pass | gemini_* scripts |
 | `NOMINATIM_EMAIL` | polite | geocoding |
 | `IMMICH_PUBLIC_URL` | optional | review-page links |
-| `NTFY_SERVER` / `NTFY_TOPIC` / `NTFY_TOKEN` | optional | monthly runner notification |
+| `NOTIFY_SPOOL_DIR` or `PROJECTS_DIR` | optional | monthly runner notification |
 
 ## Data files
 
