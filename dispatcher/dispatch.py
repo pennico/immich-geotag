@@ -1256,7 +1256,7 @@ def tick(dry):
             if dry:
                 continue
             # Seen only once the owner was actually told: a failed send
-            # (ntfy down) is retried next tick instead of being lost.
+            # (notification spool not writable) is retried next tick instead of being lost.
             sent = True
             if issue["state"] == "OPEN":
                 sent = notify.notify(f"{REPO_NAME}: needs your answer",

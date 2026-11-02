@@ -1,4 +1,5 @@
-"""Comms stability: blocker announcements must not be lost (ntfy down,
+"""Comms stability: blocker announcements must not be lost (spool not
+writable,
 lost pushes, re-labelled blockers, gh failures). Uses the isolated
 dispatcher fixture from test_dispatch.py."""
 import json
@@ -21,7 +22,7 @@ def test_blocker_announce_failure_is_retried_next_tick(env, monkeypatch):
     e.shelves.blockers = [_blocker()]
     monkeypatch.setattr(dispatch.notify, "notify", lambda *a, **k: False)
     assert dispatch.tick(False) == "blocked"
-    assert 5 not in state(e)["seen_blockers"]      # ntfy down: not "seen"
+    assert 5 not in state(e)["seen_blockers"]      # not queued: not "seen"
     monkeypatch.setattr(dispatch.notify, "notify",
                         lambda *a, **k: e.sent.append(a) or True)
     assert dispatch.tick(False) == "blocked"
