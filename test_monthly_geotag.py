@@ -8,7 +8,12 @@ never get past argument parsing.
 """
 import contextlib
 import io
+import json
+import os
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import monthly_geotag
@@ -70,6 +75,23 @@ class MainGuardTest(unittest.TestCase):
             le.assert_not_called()
         self.assertEqual(cm.exception.code, 0)
         self.assertIn("--dry", out.getvalue())
+
+
+class NotifyTest(unittest.TestCase):
+    def test_queues_through_the_dispatcher_notifier(self):
+        here = Path(monthly_geotag.__file__).resolve().parent
+        if not (here / "dispatcher" / "notify.py").exists():
+            self.skipTest("the public tree has no dispatcher")
+        with tempfile.TemporaryDirectory() as spool, \
+                mock.patch.dict(os.environ, {"NOTIFY_SPOOL_DIR": spool}):
+            monthly_geotag.notify("monthly run done", "1 applied", priority="high")
+            ev = json.loads(next(Path(spool).glob("*.json")).read_text())
+        self.assertEqual((ev["title"], ev["message"], ev["priority"]),
+                         ("monthly run done", "1 applied", 4))
+
+    def test_without_a_notifier_it_only_logs(self):
+        with mock.patch.dict(sys.modules, {"notify": None}):   # import raises ImportError
+            monthly_geotag.notify("monthly run done", "1 applied")
 
 
 if __name__ == "__main__":

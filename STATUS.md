@@ -12,7 +12,7 @@ Last updated: 2026-10-17.
   `scan` / `recognize` / `apply` subcommands around the CSV review
   buffer, `--thumbs DIR` local-read mode, fake-payload test suite.
 - `monthly_geotag.py` — self-running monthly backfill inside the
-  Vision free tier (usage ledger, never-retry state, ntfy summary);
+  Vision free tier (usage ledger, never-retry state, summary notification);
   deployed as the homelab monthly cron.
 - Extensions beyond the original plan: `cluster_fill.py` +
   `cluster_review_app.py` (visual-similarity clustering pass) and the
