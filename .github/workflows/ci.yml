@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  private-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scanner self-test
+        run: scripts/scan-private.sh --self-test
+      - name: No private patterns in the tree, the new commits and their authors
+        env:
+          # The extra private patterns are the repository secret PRIVATE_PATTERNS (one line), never in this public
+          # file. Pushes to main and same-repo pull requests fail without it; pull requests from forks and Dependabot
+          # get no secrets and scan with the built-in patterns only (the script prints a notice).
+          PRIVATE_PATTERNS: ${{ secrets.PRIVATE_PATTERNS }}
+          REQUIRE_PRIVATE_PATTERNS: ${{ (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && '1' || '0' }}
+          BEFORE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          AFTER: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          scripts/scan-private.sh --length
+          scripts/scan-private.sh
+          # The new commits: their messages, added lines and identities.
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            scripts/scan-private.sh --history "$BEFORE..$AFTER"
+          else
+            echo "::notice::No earlier commit to compare with (new branch or force push): scanning every commit after the baseline"
+            scripts/scan-private.sh --history "$AFTER"
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: pip install -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check .
+
+  test:
+    runs-on: ubuntu-24.04   # ubuntu-latest (26.04) has no Python 3.9 build; 3.9 = the supported floor
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the supported floor (pyproject requires-python), 3.12 current.
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install tools
+        run: pip install -r requirements-dev.txt
+      - name: Tests
+        run: pytest -q

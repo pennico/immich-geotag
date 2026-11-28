@@ -1,0 +1,39 @@
+.env
+*.csv
+testdata/
+__pycache__/
+*.pyc
+.DS_Store
+geotag-data/
+
+# Secrets / local env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Tool caches and build output
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+*.log
+
+# Photos and generated review pages (may contain personal data)
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.HEIC
+*.JPG
+*.JPEG
+!docs/**/*.png   # documentation screenshots (synthetic data only)
+*-review-app/
+
+# Editors
+.idea/
+.vscode/
+
+# Private pattern list for scripts/scan-private.sh (never committed)
+private/
